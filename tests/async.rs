@@ -7,7 +7,7 @@ extern crate nom;
 extern crate tokio;
 
 use futures::{Future, IntoFuture};
-use msql_srv::QueryStatusInfo;
+use msql_srv::OkResponse;
 use mysql_async::prelude::*;
 use std::io;
 use std::net;
@@ -139,7 +139,7 @@ fn it_pings() {
 #[test]
 fn empty_response() {
     TestingShim::new(
-        |_, w| w.completed(QueryStatusInfo::empty()),
+        |_, w| w.completed(OkResponse::default()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
@@ -528,7 +528,7 @@ fn insert_exec() {
             assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
             assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
 
-            let mut info = QueryStatusInfo::empty();
+            let mut info = OkResponse::default();
             info.affected_rows = 42;
             info.last_insert_id = 1;
             w.completed(info)
@@ -685,7 +685,7 @@ fn prepared_empty() {
         |_| 0,
         move |_, params, w| {
             assert!(!params.is_empty());
-            w.completed(QueryStatusInfo::empty())
+            w.completed(OkResponse::default())
         },
     )
     .with_params(params)

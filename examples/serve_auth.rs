@@ -27,13 +27,14 @@ impl<W: io::Write> MysqlShim<W> for Backend {
         _: msql_srv::ParamParser,
         results: QueryResultWriter<W>,
     ) -> io::Result<()> {
-        results.completed(QueryStatusInfo::empty())
+        let resp = OkResponse::default();
+        results.completed(resp)
     }
     fn on_close(&mut self, _: u32) {}
 
     fn on_query(&mut self, sql: &str, results: QueryResultWriter<W>) -> io::Result<()> {
         println!("execute sql {:?}", sql);
-        results.start(&[])?.finish()
+        results.start(&[])?.finish_with_info("ExtraInfo")
     }
 
     /// authenticate method for the specified plugin

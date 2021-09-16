@@ -1,7 +1,7 @@
 use crate::myc::constants::{CapabilityFlags, StatusFlags};
 use crate::myc::io::WriteMysqlExt;
 use crate::packet::PacketWriter;
-use crate::{Column, ErrorKind, QueryStatusInfo};
+use crate::{Column, ErrorKind, OkResponse};
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{self, Write};
 
@@ -17,27 +17,28 @@ pub(crate) fn write_eof_packet<W: Write>(
 pub(crate) fn write_ok_packet<W: Write>(
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
-    status_flags: StatusFlags,
-    query_status_info: QueryStatusInfo,
+    ok_packet: OkResponse,
 ) -> io::Result<()> {
     w.write_u8(0x00)?; // OK packet type
-    w.write_lenenc_int(query_status_info.affected_rows)?;
-    w.write_lenenc_int(query_status_info.last_insert_id)?;
+    w.write_lenenc_int(ok_packet.affected_rows)?;
+    w.write_lenenc_int(ok_packet.last_insert_id)?;
     if client_capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
-        w.write_u16::<LittleEndian>(status_flags.bits())?;
+        w.write_u16::<LittleEndian>(ok_packet.status_flags.bits())?;
         w.write_all(&[0x00, 0x00])?; // no warnings
     } else if client_capabilities.contains(CapabilityFlags::CLIENT_TRANSACTIONS) {
-        w.write_u16::<LittleEndian>(status_flags.bits())?;
+        w.write_u16::<LittleEndian>(ok_packet.status_flags.bits())?;
     }
 
-    let info = query_status_info.to_info_string();
     if client_capabilities.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
-        w.write_lenenc_str(info.as_bytes())?;
-        if status_flags.contains(StatusFlags::SERVER_SESSION_STATE_CHANGED) {
-            w.write_lenenc_str(query_status_info.session_state_changes.as_bytes())?;
+        w.write_lenenc_str(ok_packet.info.as_bytes())?;
+        if ok_packet
+            .status_flags
+            .contains(StatusFlags::SERVER_SESSION_STATE_CHANGED)
+        {
+            w.write_lenenc_str(ok_packet.session_state_info.as_bytes())?;
         }
     } else {
-        w.write_all(info.as_bytes())?;
+        w.write_all(ok_packet.info.as_bytes())?;
     }
     w.end_packet()
 }

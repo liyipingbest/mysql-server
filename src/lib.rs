@@ -34,7 +34,7 @@
 //!         _: ParamParser,
 //!         results: QueryResultWriter<W>,
 //!     ) -> io::Result<()> {
-//!        results.completed(QueryStatusInfo::empty())
+//!        results.completed(OkResponse::default())
 //!     }
 //!     fn on_close(&mut self, _: u32) {}
 //!
@@ -112,7 +112,6 @@ mod errorcodes;
 mod packet;
 mod params;
 mod resultset;
-mod utils;
 mod value;
 mod writers;
 
@@ -137,56 +136,20 @@ pub struct Column {
 }
 
 /// QueryStatusInfo represents the status of a query.
-pub struct QueryStatusInfo {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OkResponse {
     /// affected rows in update/insert
     pub affected_rows: u64,
-    /// read_rows rows in select query
-    pub read_rows: u64,
     /// insert_id in update/insert
     pub last_insert_id: u64,
-    /// elapsed_seconds of this query
-    pub elapsed_seconds: u64,
-    /// read_bytes of this query
-    pub read_bytes: u64,
-    /// session_state_changes of this query
-    pub session_state_changes: String,
-}
-
-impl QueryStatusInfo {
-    /// construct an empty status info
-    pub fn empty() -> Self {
-        Self {
-            affected_rows: 0,
-            read_rows: 0,
-            last_insert_id: 0,
-            elapsed_seconds: 0,
-            read_bytes: 0,
-
-            session_state_changes: "".to_owned(),
-        }
-    }
-
-    /// generate progress info string
-    pub fn to_info_string(&self) -> String {
-        if self.affected_rows > 0 && self.read_rows == 0 {
-            return "".to_owned();
-        }
-
-        let mut seconds = self.elapsed_seconds as f64;
-        if seconds == 0f64 {
-            seconds += 0.01;
-        }
-        if self.elapsed_seconds == 0 {}
-
-        format!(
-            "Read {} rows, {} in {} sec., {} rows/sec., {}/sec.",
-            self.read_rows,
-            utils::convert_byte_size(self.read_bytes as f64),
-            self.elapsed_seconds,
-            utils::convert_number_size((self.read_rows as f64) / (seconds as f64)),
-            utils::convert_byte_size((self.read_bytes as f64) / (seconds as f64)),
-        )
-    }
+    /// StatusFlags associated with this query
+    pub status_flags: StatusFlags,
+    /// Warnings
+    pub warnings: u16,
+    /// Extra infomation
+    pub info: String,
+    /// session state change information
+    pub session_state_info: String,
 }
 
 pub use crate::errorcodes::ErrorKind;
@@ -488,8 +451,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         writers::write_ok_packet(
             &mut self.writer,
             self.client_capabilities,
-            StatusFlags::empty(),
-            QueryStatusInfo::empty(),
+            OkResponse::default(),
         )?;
         self.writer.flush()?;
 
@@ -513,20 +475,24 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                             self.client_capabilities,
                         );
                         let var = &q[b"SELECT @@".len()..];
+                        let var_with_at = &q[b"SELECT ".len()..];
+                        let cols = &[Column {
+                            table: String::new(),
+                            column: String::from_utf8_lossy(var_with_at).to_string(),
+                            coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
+                            colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                        }];
+
                         match var {
                             b"max_allowed_packet" => {
-                                let cols = &[Column {
-                                    table: String::new(),
-                                    column: "@@max_allowed_packet".to_owned(),
-                                    coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
-                                    colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
-                                }];
                                 let mut w = w.start(cols)?;
                                 w.write_row(iter::once(67108864u32))?;
                                 w.finish()?;
                             }
                             _ => {
-                                w.completed(QueryStatusInfo::empty())?;
+                                let mut w = w.start(cols)?;
+                                w.write_row(iter::once(0))?;
+                                w.finish()?;
                             }
                         }
                     } else if q.starts_with(b"USE ") || q.starts_with(b"use ") {
@@ -624,8 +590,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     writers::write_ok_packet(
                         &mut self.writer,
                         self.client_capabilities,
-                        StatusFlags::empty(),
-                        QueryStatusInfo::empty(),
+                        OkResponse::default(),
                     )?;
                 }
                 Command::Quit => {
