@@ -41,6 +41,7 @@ impl<'a, W: Write + 'a> InitWriter<'a, W> {
 pub struct StatementMetaWriter<'a, W: Write> {
     pub(crate) writer: &'a mut PacketWriter<W>,
     pub(crate) stmts: &'a mut HashMap<u32, StatementData>,
+    pub(crate) client_capabilities: CapabilityFlags,
 }
 
 impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
@@ -66,7 +67,7 @@ impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
                 ..Default::default()
             },
         );
-        writers::write_prepare_ok(id, params, columns, self.writer)
+        writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities)
     }
 
     /// Reply to the client's `PREPARE` with an error.
@@ -199,6 +200,7 @@ impl<'a, W: Write> Drop for QueryResultWriter<'a, W> {
 /// call [`finish`](struct.RowWriter.html#method.finish) explicitly.
 #[must_use]
 pub struct RowWriter<'a, W: Write> {
+    client_capabilities: CapabilityFlags,
     result: Option<QueryResultWriter<'a, W>>,
     bitmap_len: usize,
     data: Vec<u8>,
@@ -219,7 +221,9 @@ where
         columns: &'a [Column],
     ) -> io::Result<RowWriter<'a, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
+        let client_capabilities = result.client_capabilities;
         let mut rw = RowWriter {
+            client_capabilities,
             result: Some(result),
             columns,
             bitmap_len,
@@ -236,8 +240,13 @@ where
     #[inline]
     fn start(&mut self) -> io::Result<()> {
         if !self.columns.is_empty() {
-            writers::column_definitions(self.columns, self.result.as_mut().unwrap().writer)?;
+            writers::column_definitions(
+                self.columns,
+                self.result.as_mut().unwrap().writer,
+                self.client_capabilities,
+            )?;
         }
+
         Ok(())
     }
 
@@ -365,6 +374,15 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
                 // response to no column query is always an OK packet
                 let mut resp = OkResponse::default();
                 resp.info = extra_info.to_string();
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
+            } else if self
+                .client_capabilities
+                .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+            {
+                // response to no column query is always an OK packet
+                let mut resp = OkResponse::default();
+                resp.info = extra_info.to_string();
+                resp.header = 0xfe;
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
                 // we wrote out at least one row

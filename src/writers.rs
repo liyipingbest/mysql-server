@@ -19,7 +19,7 @@ pub(crate) fn write_ok_packet<W: Write>(
     client_capabilities: CapabilityFlags,
     ok_packet: OkResponse,
 ) -> io::Result<()> {
-    w.write_u8(0x00)?; // OK packet type
+    w.write_u8(ok_packet.header)?; // OK packet type
     w.write_lenenc_int(ok_packet.affected_rows)?;
     w.write_lenenc_int(ok_packet.last_insert_id)?;
     if client_capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
@@ -59,6 +59,7 @@ pub(crate) fn write_prepare_ok<'a, PI, CI, W>(
     params: PI,
     columns: CI,
     w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
 ) -> io::Result<()>
 where
     PI: IntoIterator<Item = &'a Column>,
@@ -79,15 +80,15 @@ where
     w.write_u16::<LittleEndian>(0)?; // number of warnings
     w.end_packet()?;
 
-    write_column_definitions(pi, w, false, true)?;
-    write_column_definitions(ci, w, false, true)
+    write_column_definitions(pi, w, false, client_capabilities)?;
+    write_column_definitions(ci, w, false, client_capabilities)
 }
 
 pub(crate) fn write_column_definitions<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,
     is_comm_field_list_response: bool,
-    only_eof_on_nonempty: bool,
+    client_capabilities: CapabilityFlags,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
@@ -122,14 +123,18 @@ where
         empty = false;
     }
 
-    if empty && only_eof_on_nonempty {
-        Ok(())
-    } else {
+    if !empty && !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
         write_eof_packet(w, StatusFlags::empty())
+    } else {
+        Ok(())
     }
 }
 
-pub(crate) fn column_definitions<'a, I, W>(i: I, w: &mut PacketWriter<W>) -> io::Result<()>
+pub(crate) fn column_definitions<'a, I, W>(
+    i: I,
+    w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
+) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
     <I as IntoIterator>::IntoIter: ExactSizeIterator,
@@ -138,5 +143,5 @@ where
     let i = i.into_iter();
     w.write_lenenc_int(i.len() as u64)?;
     w.end_packet()?;
-    write_column_definitions(i, w, false, false)
+    write_column_definitions(i, w, false, client_capabilities)
 }

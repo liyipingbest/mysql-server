@@ -138,6 +138,8 @@ pub struct Column {
 /// QueryStatusInfo represents the status of a query.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OkResponse {
+    /// header
+    pub header: u8,
     /// affected rows in update/insert
     pub affected_rows: u64,
     /// insert_id in update/insert
@@ -324,6 +326,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
                 | CapabilityFlags::CLIENT_CONNECT_WITH_DB
                 | CapabilityFlags::CLIENT_RESERVED
+                | CapabilityFlags::CLIENT_DEPRECATE_EOF
             // | CapabilityFlags::CLIENT_SSL
         )
             .bits();
@@ -521,6 +524,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     let w = StatementMetaWriter {
                         writer: &mut self.writer,
                         stmts: &mut stmts,
+                        client_capabilities: self.client_capabilities,
                     };
 
                     self.shim.on_prepare(
@@ -573,7 +577,12 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                         colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
                     }];
-                    writers::write_column_definitions(cols, &mut self.writer, true, true)?;
+                    writers::write_column_definitions(
+                        cols,
+                        &mut self.writer,
+                        true,
+                        self.client_capabilities,
+                    )?;
                 }
                 Command::Init(schema) => {
                     let w = InitWriter {

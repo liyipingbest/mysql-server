@@ -11,6 +11,7 @@ extern crate mysql_common as myc;
 
 use msql_srv::*;
 use std::io;
+use std::iter;
 use std::net;
 use std::thread;
 
@@ -34,7 +35,19 @@ impl<W: io::Write> MysqlShim<W> for Backend {
 
     fn on_query(&mut self, sql: &str, results: QueryResultWriter<W>) -> io::Result<()> {
         println!("execute sql {:?}", sql);
-        results.start(&[])?.finish_with_info("ExtraInfo")
+
+        let cols = &[Column {
+            table: String::new(),
+            column: "abc".to_string(),
+            coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
+            colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+        }];
+
+        let mut w = results.start(cols)?;
+        w.write_row(iter::once(67108864u32))?;
+        w.write_row(iter::once(167108864u32))?;
+
+        w.finish_with_info("ExtraInfo")
     }
 
     /// authenticate method for the specified plugin
