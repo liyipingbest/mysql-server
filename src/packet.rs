@@ -93,6 +93,7 @@ impl<R: Read> PacketReader<R> {
                     let bytes = &self.bytes[self.start..];
                     unsafe { ::std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
                 };
+
                 match packet(bytes) {
                     Ok((rest, p)) => {
                         self.remaining = rest.len();
