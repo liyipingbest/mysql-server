@@ -231,7 +231,7 @@ pub trait MysqlShim<W: Write> {
         for i in 0..SCRAMBLE_SIZE {
             scramble[i] = bs[i];
             if scramble[i] == b'\0' || scramble[i] == b'$' {
-                scramble[i] = scramble[i] + 1;
+                scramble[i] += 1;
             }
         }
         scramble
@@ -481,7 +481,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     &mut self.writer,
                 )?;
                 self.writer.flush()?;
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg))?;
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
             }
         }
 
