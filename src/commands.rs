@@ -2,9 +2,9 @@ use crate::myc::constants::{CapabilityFlags, Command as CommandByte};
 
 #[derive(Debug)]
 pub struct ClientHandshake {
-    capabilities: CapabilityFlags,
     maxps: u32,
-    collation: u16,
+    pub(crate) capabilities: CapabilityFlags,
+    pub(crate) collation: u16,
     pub(crate) db: Option<Vec<u8>>,
     pub(crate) username: Vec<u8>,
     pub(crate) auth_response: Vec<u8>,
@@ -66,7 +66,7 @@ pub fn client_handshake(i: &[u8]) -> nom::IResult<&[u8], ClientHandshake> {
         Ok((
             i,
             ClientHandshake {
-                capabilities: CapabilityFlags::from_bits_truncate(cap),
+                capabilities,
                 maxps,
                 collation: u16::from(collation[0]),
                 username: username.to_vec(),
@@ -99,7 +99,7 @@ pub fn client_handshake(i: &[u8]) -> nom::IResult<&[u8], ClientHandshake> {
         Ok((
             i,
             ClientHandshake {
-                capabilities: CapabilityFlags::from_bits_truncate(cap as u32),
+                capabilities,
                 maxps,
                 collation: 0,
                 username: username.to_vec(),

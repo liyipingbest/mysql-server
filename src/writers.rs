@@ -1,7 +1,7 @@
-use crate::myc::constants::StatusFlags;
+use crate::myc::constants::{CapabilityFlags, StatusFlags};
 use crate::myc::io::WriteMysqlExt;
 use crate::packet::PacketWriter;
-use crate::{Column, ErrorKind};
+use crate::{Column, ErrorKind, QueryStatusInfo};
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{self, Write};
 
@@ -16,15 +16,29 @@ pub(crate) fn write_eof_packet<W: Write>(
 
 pub(crate) fn write_ok_packet<W: Write>(
     w: &mut PacketWriter<W>,
-    rows: u64,
-    last_insert_id: u64,
-    s: StatusFlags,
+    client_capabilities: CapabilityFlags,
+    status_flags: StatusFlags,
+    query_status_info: QueryStatusInfo,
 ) -> io::Result<()> {
     w.write_u8(0x00)?; // OK packet type
-    w.write_lenenc_int(rows)?;
-    w.write_lenenc_int(last_insert_id)?;
-    w.write_u16::<LittleEndian>(s.bits())?;
-    w.write_all(&[0x00, 0x00])?; // no warnings
+    w.write_lenenc_int(query_status_info.affected_rows)?;
+    w.write_lenenc_int(query_status_info.last_insert_id)?;
+    if client_capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
+        w.write_u16::<LittleEndian>(status_flags.bits())?;
+        w.write_all(&[0x00, 0x00])?; // no warnings
+    } else if client_capabilities.contains(CapabilityFlags::CLIENT_TRANSACTIONS) {
+        w.write_u16::<LittleEndian>(status_flags.bits())?;
+    }
+
+    let info = query_status_info.to_info_string();
+    if client_capabilities.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
+        w.write_lenenc_str(info.as_bytes())?;
+        if status_flags.contains(StatusFlags::SERVER_SESSION_STATE_CHANGED) {
+            w.write_lenenc_str(query_status_info.session_state_changes.as_bytes())?;
+        }
+    } else {
+        w.write_all(info.as_bytes())?;
+    }
     w.end_packet()
 }
 

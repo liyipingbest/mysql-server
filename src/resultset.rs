@@ -1,7 +1,7 @@
-use crate::myc::constants::{ColumnFlags, StatusFlags};
+use crate::myc::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
 use crate::packet::PacketWriter;
 use crate::value::ToMysqlValue;
-use crate::writers;
+use crate::{writers, QueryStatusInfo};
 use crate::{Column, ErrorKind, StatementData};
 use byteorder::WriteBytesExt;
 use std::borrow::Borrow;
@@ -10,13 +10,19 @@ use std::io::{self, Write};
 
 /// Convenience type for responding to a client `USE <db>` command.
 pub struct InitWriter<'a, W: Write> {
+    pub(crate) client_capabilities: CapabilityFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
 }
 
 impl<'a, W: Write + 'a> InitWriter<'a, W> {
     /// Tell client that database context has been changed
     pub fn ok(self) -> io::Result<()> {
-        writers::write_ok_packet(self.writer, 0, 0, StatusFlags::empty())
+        writers::write_ok_packet(
+            self.writer,
+            self.client_capabilities,
+            StatusFlags::empty(),
+            QueryStatusInfo::empty(),
+        )
     }
 
     /// Tell client that there was a problem changing the database context.
@@ -78,7 +84,7 @@ impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
 }
 
 enum Finalizer {
-    Ok { rows: u64, last_insert_id: u64 },
+    Ok(QueryStatusInfo),
     Eof,
 }
 
@@ -103,14 +109,20 @@ enum Finalizer {
 pub struct QueryResultWriter<'a, W: Write> {
     // XXX: specialization instead?
     pub(crate) is_bin: bool,
+    pub(crate) client_capabilities: CapabilityFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
     last_end: Option<Finalizer>,
 }
 
 impl<'a, W: Write> QueryResultWriter<'a, W> {
-    pub(crate) fn new(writer: &'a mut PacketWriter<W>, is_bin: bool) -> Self {
+    pub(crate) fn new(
+        writer: &'a mut PacketWriter<W>,
+        is_bin: bool,
+        client_capabilities: CapabilityFlags,
+    ) -> Self {
         QueryResultWriter {
             is_bin,
+            client_capabilities,
             writer,
             last_end: None,
         }
@@ -123,10 +135,9 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
         }
         match self.last_end.take() {
             None => Ok(()),
-            Some(Finalizer::Ok {
-                rows,
-                last_insert_id,
-            }) => writers::write_ok_packet(self.writer, rows, last_insert_id, status),
+            Some(Finalizer::Ok(info)) => {
+                writers::write_ok_packet(self.writer, self.client_capabilities, status, info)
+            }
             Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status),
         }
     }
@@ -144,20 +155,17 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query in this resultset. `last_insert_id` may be given to communiate an identifier for
     /// a client's most recent insertion.
-    pub fn complete_one(mut self, rows: u64, last_insert_id: u64) -> io::Result<Self> {
+    pub fn complete_one(mut self, info: QueryStatusInfo) -> io::Result<Self> {
         self.finalize(true)?;
-        self.last_end = Some(Finalizer::Ok {
-            rows,
-            last_insert_id,
-        });
+        self.last_end = Some(Finalizer::Ok(info));
         Ok(self)
     }
 
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query. `last_insert_id` may be given to communiate an identifier for a client's most
     /// recent insertion.
-    pub fn completed(self, rows: u64, last_insert_id: u64) -> io::Result<()> {
-        self.complete_one(rows, last_insert_id)?.no_more_results()
+    pub fn completed(self, info: QueryStatusInfo) -> io::Result<()> {
+        self.complete_one(info)?.no_more_results()
     }
 
     /// Reply to the client's query with an error.
@@ -361,11 +369,8 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
         if complete {
             if self.columns.is_empty() {
                 // response to no column query is always an OK packet
-                // we've kept track of the number of rows in col (hacky, I know)
-                self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok {
-                    rows: self.col as u64,
-                    last_insert_id: 0,
-                });
+                self.result.as_mut().unwrap().last_end =
+                    Some(Finalizer::Ok(QueryStatusInfo::empty()));
             } else {
                 // we wrote out at least one row
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);

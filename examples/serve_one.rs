@@ -26,7 +26,7 @@ impl<W: io::Write> MysqlShim<W> for Backend {
         _: msql_srv::ParamParser,
         results: QueryResultWriter<W>,
     ) -> io::Result<()> {
-        results.completed(0, 0)
+        results.completed(QueryStatusInfo::empty())
     }
     fn on_close(&mut self, _: u32) {}
 

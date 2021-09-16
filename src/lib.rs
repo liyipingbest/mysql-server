@@ -34,7 +34,7 @@
 //!         _: ParamParser,
 //!         results: QueryResultWriter<W>,
 //!     ) -> io::Result<()> {
-//!         results.completed(0, 0)
+//!        results.completed(QueryStatusInfo::empty())
 //!     }
 //!     fn on_close(&mut self, _: u32) {}
 //!
@@ -112,6 +112,7 @@ mod errorcodes;
 mod packet;
 mod params;
 mod resultset;
+mod utils;
 mod value;
 mod writers;
 
@@ -133,6 +134,59 @@ pub struct Column {
     ///
     /// Of particular interest are `ColumnFlags::UNSIGNED_FLAG` and `ColumnFlags::NOT_NULL_FLAG`.
     pub colflags: ColumnFlags,
+}
+
+/// QueryStatusInfo represents the status of a query.
+pub struct QueryStatusInfo {
+    /// affected rows in update/insert
+    pub affected_rows: u64,
+    /// read_rows rows in select query
+    pub read_rows: u64,
+    /// insert_id in update/insert
+    pub last_insert_id: u64,
+    /// elapsed_seconds of this query
+    pub elapsed_seconds: u64,
+    /// read_bytes of this query
+    pub read_bytes: u64,
+    /// session_state_changes of this query
+    pub session_state_changes: String,
+}
+
+impl QueryStatusInfo {
+    /// construct an empty status info
+    pub fn empty() -> Self {
+        Self {
+            affected_rows: 0,
+            read_rows: 0,
+            last_insert_id: 0,
+            elapsed_seconds: 0,
+            read_bytes: 0,
+
+            session_state_changes: "".to_owned(),
+        }
+    }
+
+    /// generate progress info string
+    pub fn to_info_string(&self) -> String {
+        if self.affected_rows > 0 && self.read_rows == 0 {
+            return "".to_owned();
+        }
+
+        let mut seconds = self.elapsed_seconds as f64;
+        if seconds == 0f64 {
+            seconds += 0.01;
+        }
+        if self.elapsed_seconds == 0 {}
+
+        format!(
+            "Read {} rows, {} in {} sec., {} rows/sec., {}/sec.",
+            self.read_rows,
+            utils::convert_byte_size(self.read_bytes as f64),
+            self.elapsed_seconds,
+            utils::convert_number_size((self.read_rows as f64) / (seconds as f64)),
+            utils::convert_byte_size((self.read_bytes as f64) / (seconds as f64)),
+        )
+    }
 }
 
 pub use crate::errorcodes::ErrorKind;
@@ -240,6 +294,7 @@ pub trait MysqlShim<W: Write> {
 /// A server that speaks the MySQL/MariaDB protocol, and can delegate client commands to a backend
 /// that implements [`MysqlShim`](trait.MysqlShim.html).
 pub struct MysqlIntermediary<B, R: Read, W: Write> {
+    pub(crate) client_capabilities: CapabilityFlags,
     shim: B,
     reader: packet::PacketReader<R>,
     writer: packet::PacketWriter<W>,
@@ -279,6 +334,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         let r = packet::PacketReader::new(reader);
         let w = packet::PacketWriter::new(writer);
         let mut mi = MysqlIntermediary {
+            client_capabilities: CapabilityFlags::from_bits_truncate(0),
             shim,
             reader: r,
             writer: w,
@@ -378,6 +434,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 })?
                 .1;
 
+            self.client_capabilities = handshake.capabilities;
             let mut auth_response = handshake.auth_response.clone();
             let auth_plugin_expect = self.shim.auth_plugin_for_username(&handshake.username);
 
@@ -428,7 +485,12 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
             }
         }
 
-        writers::write_ok_packet(&mut self.writer, 0, 0, StatusFlags::empty())?;
+        writers::write_ok_packet(
+            &mut self.writer,
+            self.client_capabilities,
+            StatusFlags::empty(),
+            QueryStatusInfo::empty(),
+        )?;
         self.writer.flush()?;
 
         Ok(())
@@ -441,10 +503,15 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         while let Some((seq, packet)) = self.reader.next()? {
             self.writer.set_seq(seq + 1);
             let cmd = commands::parse(&packet).unwrap().1;
+
             match cmd {
                 Command::Query(q) => {
                     if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
-                        let w = QueryResultWriter::new(&mut self.writer, false);
+                        let w = QueryResultWriter::new(
+                            &mut self.writer,
+                            false,
+                            self.client_capabilities,
+                        );
                         let var = &q[b"SELECT @@".len()..];
                         match var {
                             b"max_allowed_packet" => {
@@ -459,11 +526,12 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                                 w.finish()?;
                             }
                             _ => {
-                                w.completed(0, 0)?;
+                                w.completed(QueryStatusInfo::empty())?;
                             }
                         }
                     } else if q.starts_with(b"USE ") || q.starts_with(b"use ") {
                         let w = InitWriter {
+                            client_capabilities: self.client_capabilities,
                             writer: &mut self.writer,
                         };
                         let schema = ::std::str::from_utf8(&q[b"USE ".len()..])
@@ -471,7 +539,11 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                         let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                         self.shim.on_init(schema, w)?;
                     } else {
-                        let w = QueryResultWriter::new(&mut self.writer, false);
+                        let w = QueryResultWriter::new(
+                            &mut self.writer,
+                            false,
+                            self.client_capabilities,
+                        );
                         self.shim.on_query(
                             ::std::str::from_utf8(q)
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
@@ -500,7 +572,11 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     })?;
                     {
                         let params = params::ParamParser::new(params, state);
-                        let w = QueryResultWriter::new(&mut self.writer, true);
+                        let w = QueryResultWriter::new(
+                            &mut self.writer,
+                            true,
+                            self.client_capabilities,
+                        );
                         self.shim.on_execute(stmt, params, w)?;
                     }
                     state.long_data.clear();
@@ -535,6 +611,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 }
                 Command::Init(schema) => {
                     let w = InitWriter {
+                        client_capabilities: self.client_capabilities,
                         writer: &mut self.writer,
                     };
                     self.shim.on_init(
@@ -544,7 +621,12 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     )?;
                 }
                 Command::Ping => {
-                    writers::write_ok_packet(&mut self.writer, 0, 0, StatusFlags::empty())?;
+                    writers::write_ok_packet(
+                        &mut self.writer,
+                        self.client_capabilities,
+                        StatusFlags::empty(),
+                        QueryStatusInfo::empty(),
+                    )?;
                 }
                 Command::Quit => {
                     break;
