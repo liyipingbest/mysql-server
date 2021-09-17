@@ -1,7 +1,7 @@
-use crate::myc::constants::{ColumnFlags, StatusFlags};
+use crate::myc::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
 use crate::packet::PacketWriter;
 use crate::value::ToMysqlValue;
-use crate::writers;
+use crate::{writers, OkResponse};
 use crate::{Column, ErrorKind, StatementData};
 use byteorder::WriteBytesExt;
 use std::borrow::Borrow;
@@ -10,13 +10,14 @@ use std::io::{self, Write};
 
 /// Convenience type for responding to a client `USE <db>` command.
 pub struct InitWriter<'a, W: Write> {
+    pub(crate) client_capabilities: CapabilityFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
 }
 
 impl<'a, W: Write + 'a> InitWriter<'a, W> {
     /// Tell client that database context has been changed
     pub fn ok(self) -> io::Result<()> {
-        writers::write_ok_packet(self.writer, 0, 0, StatusFlags::empty())
+        writers::write_ok_packet(self.writer, self.client_capabilities, OkResponse::default())
     }
 
     /// Tell client that there was a problem changing the database context.
@@ -40,6 +41,7 @@ impl<'a, W: Write + 'a> InitWriter<'a, W> {
 pub struct StatementMetaWriter<'a, W: Write> {
     pub(crate) writer: &'a mut PacketWriter<W>,
     pub(crate) stmts: &'a mut HashMap<u32, StatementData>,
+    pub(crate) client_capabilities: CapabilityFlags,
 }
 
 impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
@@ -65,7 +67,7 @@ impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
                 ..Default::default()
             },
         );
-        writers::write_prepare_ok(id, params, columns, self.writer)
+        writers::write_prepare_ok(id, params, columns, self.writer, self.client_capabilities)
     }
 
     /// Reply to the client's `PREPARE` with an error.
@@ -78,7 +80,7 @@ impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
 }
 
 enum Finalizer {
-    Ok { rows: u64, last_insert_id: u64 },
+    Ok(OkResponse),
     Eof,
 }
 
@@ -103,14 +105,20 @@ enum Finalizer {
 pub struct QueryResultWriter<'a, W: Write> {
     // XXX: specialization instead?
     pub(crate) is_bin: bool,
+    pub(crate) client_capabilities: CapabilityFlags,
     pub(crate) writer: &'a mut PacketWriter<W>,
     last_end: Option<Finalizer>,
 }
 
 impl<'a, W: Write> QueryResultWriter<'a, W> {
-    pub(crate) fn new(writer: &'a mut PacketWriter<W>, is_bin: bool) -> Self {
+    pub(crate) fn new(
+        writer: &'a mut PacketWriter<W>,
+        is_bin: bool,
+        client_capabilities: CapabilityFlags,
+    ) -> Self {
         QueryResultWriter {
             is_bin,
+            client_capabilities,
             writer,
             last_end: None,
         }
@@ -123,10 +131,9 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
         }
         match self.last_end.take() {
             None => Ok(()),
-            Some(Finalizer::Ok {
-                rows,
-                last_insert_id,
-            }) => writers::write_ok_packet(self.writer, rows, last_insert_id, status),
+            Some(Finalizer::Ok(ok_packet)) => {
+                writers::write_ok_packet(self.writer, self.client_capabilities, ok_packet)
+            }
             Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status),
         }
     }
@@ -144,20 +151,17 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query in this resultset. `last_insert_id` may be given to communiate an identifier for
     /// a client's most recent insertion.
-    pub fn complete_one(mut self, rows: u64, last_insert_id: u64) -> io::Result<Self> {
+    pub fn complete_one(mut self, ok_packet: OkResponse) -> io::Result<Self> {
         self.finalize(true)?;
-        self.last_end = Some(Finalizer::Ok {
-            rows,
-            last_insert_id,
-        });
+        self.last_end = Some(Finalizer::Ok(ok_packet));
         Ok(self)
     }
 
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query. `last_insert_id` may be given to communiate an identifier for a client's most
     /// recent insertion.
-    pub fn completed(self, rows: u64, last_insert_id: u64) -> io::Result<()> {
-        self.complete_one(rows, last_insert_id)?.no_more_results()
+    pub fn completed(self, ok_packet: OkResponse) -> io::Result<()> {
+        self.complete_one(ok_packet)?.no_more_results()
     }
 
     /// Reply to the client's query with an error.
@@ -196,6 +200,7 @@ impl<'a, W: Write> Drop for QueryResultWriter<'a, W> {
 /// call [`finish`](struct.RowWriter.html#method.finish) explicitly.
 #[must_use]
 pub struct RowWriter<'a, W: Write> {
+    client_capabilities: CapabilityFlags,
     result: Option<QueryResultWriter<'a, W>>,
     bitmap_len: usize,
     data: Vec<u8>,
@@ -204,7 +209,6 @@ pub struct RowWriter<'a, W: Write> {
     // next column to write for the current row
     // NOTE: (ab)used to track number of *rows* for a zero-column resultset
     col: usize,
-
     finished: bool,
 }
 
@@ -217,7 +221,9 @@ where
         columns: &'a [Column],
     ) -> io::Result<RowWriter<'a, W>> {
         let bitmap_len = (columns.len() + 7 + 2) / 8;
+        let client_capabilities = result.client_capabilities;
         let mut rw = RowWriter {
+            client_capabilities,
             result: Some(result),
             columns,
             bitmap_len,
@@ -234,8 +240,13 @@ where
     #[inline]
     fn start(&mut self) -> io::Result<()> {
         if !self.columns.is_empty() {
-            writers::column_definitions(self.columns, self.result.as_mut().unwrap().writer)?;
+            writers::column_definitions(
+                self.columns,
+                self.result.as_mut().unwrap().writer,
+                self.client_capabilities,
+            )?;
         }
+
         Ok(())
     }
 
@@ -347,7 +358,7 @@ where
 }
 
 impl<'a, W: Write + 'a> RowWriter<'a, W> {
-    fn finish_inner(&mut self, complete: bool) -> io::Result<()> {
+    fn finish_inner(&mut self, extra_info: &str, complete: bool) -> io::Result<()> {
         if self.finished {
             return Ok(());
         }
@@ -361,11 +372,18 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
         if complete {
             if self.columns.is_empty() {
                 // response to no column query is always an OK packet
-                // we've kept track of the number of rows in col (hacky, I know)
-                self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok {
-                    rows: self.col as u64,
-                    last_insert_id: 0,
-                });
+                let mut resp = OkResponse::default();
+                resp.info = extra_info.to_string();
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
+            } else if self
+                .client_capabilities
+                .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+            {
+                // response to no column query is always an OK packet
+                let mut resp = OkResponse::default();
+                resp.info = extra_info.to_string();
+                resp.header = 0xfe;
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
                 // we wrote out at least one row
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
@@ -377,12 +395,25 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
 
     /// Indicate to the client that no more rows are coming.
     pub fn finish(self) -> io::Result<()> {
-        self.finish_one()?.no_more_results()
+        self.finish_with_info("")
     }
 
     /// End this resultset response, and indicate to the client that no more rows are coming.
-    pub fn finish_one(mut self) -> io::Result<QueryResultWriter<'a, W>> {
-        self.finish_inner(true)?;
+    pub fn finish_one(self) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_one_with_info("")
+    }
+
+    /// Indicate to the client that no more rows are coming.
+    pub fn finish_with_info(self, extra_info: &str) -> io::Result<()> {
+        self.finish_one_with_info(extra_info)?.no_more_results()
+    }
+
+    /// End this resultset response, and indicate to the client that no more rows are coming.
+    pub fn finish_one_with_info(
+        mut self,
+        extra_info: &str,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_inner(extra_info, true)?;
 
         // we know that dropping self will see self.finished == true,
         // and so Drop won't try to use self.result.
@@ -394,7 +425,7 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
     where
         E: Borrow<[u8]>,
     {
-        self.finish_inner(false)?;
+        self.finish_inner("", false)?;
 
         self.result.take().unwrap().error(kind, msg)
     }
@@ -402,6 +433,6 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
 
 impl<'a, W: Write + 'a> Drop for RowWriter<'a, W> {
     fn drop(&mut self) {
-        self.finish_inner(true).unwrap();
+        self.finish_inner("", true).unwrap();
     }
 }

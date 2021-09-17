@@ -1,7 +1,7 @@
-use crate::myc::constants::StatusFlags;
+use crate::myc::constants::{CapabilityFlags, StatusFlags};
 use crate::myc::io::WriteMysqlExt;
 use crate::packet::PacketWriter;
-use crate::{Column, ErrorKind};
+use crate::{Column, ErrorKind, OkResponse};
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{self, Write};
 
@@ -16,15 +16,30 @@ pub(crate) fn write_eof_packet<W: Write>(
 
 pub(crate) fn write_ok_packet<W: Write>(
     w: &mut PacketWriter<W>,
-    rows: u64,
-    last_insert_id: u64,
-    s: StatusFlags,
+    client_capabilities: CapabilityFlags,
+    ok_packet: OkResponse,
 ) -> io::Result<()> {
-    w.write_u8(0x00)?; // OK packet type
-    w.write_lenenc_int(rows)?;
-    w.write_lenenc_int(last_insert_id)?;
-    w.write_u16::<LittleEndian>(s.bits())?;
-    w.write_all(&[0x00, 0x00])?; // no warnings
+    w.write_u8(ok_packet.header)?; // OK packet type
+    w.write_lenenc_int(ok_packet.affected_rows)?;
+    w.write_lenenc_int(ok_packet.last_insert_id)?;
+    if client_capabilities.contains(CapabilityFlags::CLIENT_PROTOCOL_41) {
+        w.write_u16::<LittleEndian>(ok_packet.status_flags.bits())?;
+        w.write_all(&[0x00, 0x00])?; // no warnings
+    } else if client_capabilities.contains(CapabilityFlags::CLIENT_TRANSACTIONS) {
+        w.write_u16::<LittleEndian>(ok_packet.status_flags.bits())?;
+    }
+
+    if client_capabilities.contains(CapabilityFlags::CLIENT_SESSION_TRACK) {
+        w.write_lenenc_str(ok_packet.info.as_bytes())?;
+        if ok_packet
+            .status_flags
+            .contains(StatusFlags::SERVER_SESSION_STATE_CHANGED)
+        {
+            w.write_lenenc_str(ok_packet.session_state_info.as_bytes())?;
+        }
+    } else {
+        w.write_all(ok_packet.info.as_bytes())?;
+    }
     w.end_packet()
 }
 
@@ -44,6 +59,7 @@ pub(crate) fn write_prepare_ok<'a, PI, CI, W>(
     params: PI,
     columns: CI,
     w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
 ) -> io::Result<()>
 where
     PI: IntoIterator<Item = &'a Column>,
@@ -64,15 +80,15 @@ where
     w.write_u16::<LittleEndian>(0)?; // number of warnings
     w.end_packet()?;
 
-    write_column_definitions(pi, w, false, true)?;
-    write_column_definitions(ci, w, false, true)
+    write_column_definitions(pi, w, false, client_capabilities)?;
+    write_column_definitions(ci, w, false, client_capabilities)
 }
 
 pub(crate) fn write_column_definitions<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,
     is_comm_field_list_response: bool,
-    only_eof_on_nonempty: bool,
+    client_capabilities: CapabilityFlags,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
@@ -107,14 +123,18 @@ where
         empty = false;
     }
 
-    if empty && only_eof_on_nonempty {
-        Ok(())
-    } else {
+    if !empty && !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
         write_eof_packet(w, StatusFlags::empty())
+    } else {
+        Ok(())
     }
 }
 
-pub(crate) fn column_definitions<'a, I, W>(i: I, w: &mut PacketWriter<W>) -> io::Result<()>
+pub(crate) fn column_definitions<'a, I, W>(
+    i: I,
+    w: &mut PacketWriter<W>,
+    client_capabilities: CapabilityFlags,
+) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
     <I as IntoIterator>::IntoIter: ExactSizeIterator,
@@ -123,5 +143,5 @@ where
     let i = i.into_iter();
     w.write_lenenc_int(i.len() as u64)?;
     w.end_packet()?;
-    write_column_definitions(i, w, false, false)
+    write_column_definitions(i, w, false, client_capabilities)
 }

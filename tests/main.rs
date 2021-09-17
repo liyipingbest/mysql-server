@@ -4,6 +4,7 @@ extern crate mysql;
 extern crate mysql_common as myc;
 extern crate nom;
 
+use msql_srv::OkResponse;
 use mysql::prelude::*;
 use std::io;
 use std::net;
@@ -189,7 +190,7 @@ fn it_pings() {
 #[test]
 fn empty_response() {
     TestingShim::new(
-        |_, w| w.completed(0, 0),
+        |_, w| w.completed(OkResponse::default()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
         |_, _| unreachable!(),
@@ -613,7 +614,10 @@ fn insert_exec() {
             assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
             assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
 
-            w.completed(42, 1)
+            let mut info = OkResponse::default();
+            info.affected_rows = 42;
+            info.last_insert_id = 1;
+            w.completed(info)
         },
         |_, _| unreachable!(),
     )
@@ -764,7 +768,7 @@ fn prepared_empty() {
         |_| 0,
         move |_, params, w| {
             assert!(!params.is_empty());
-            w.completed(0, 0)
+            w.completed(OkResponse::default())
         },
         |_, _| unreachable!(),
     )
