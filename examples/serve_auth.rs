@@ -53,16 +53,11 @@ impl<W: io::Write> MysqlShim<W> for Backend {
     /// authenticate method for the specified plugin
     fn authenticate(
         &self,
-        auth_plugin: &str,
+        _auth_plugin: &str,
         username: &[u8],
-        salt: &[u8],
-        auth_data: &[u8],
+        _salt: &[u8],
+        _auth_data: &[u8],
     ) -> bool {
-        println!(
-            "auth_plugin, {:?},  user: {:?} ,  salt: {:?}, auth_data:{:?}",
-            auth_plugin, username, salt, auth_data
-        );
-
         username == "default".as_bytes()
     }
 
@@ -102,10 +97,9 @@ impl<W: io::Write> MysqlShim<W> for Backend {
 
 fn main() {
     let mut threads = Vec::new();
-    let listener = net::TcpListener::bind("127.0.0.1:3306").unwrap();
+    let listener = net::TcpListener::bind("0.0.0.0:3306").unwrap();
 
     while let Ok((s, _)) = listener.accept() {
-        println!("{:?}", "got one socket");
         threads.push(thread::spawn(move || {
             MysqlIntermediary::run_on_tcp(Backend, s).unwrap();
         }));
