@@ -366,7 +366,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         self.writer.flush()?;
 
         {
-            let (seq, handshake) = self.reader.next()?.ok_or_else(|| {
+            let (mut seq, handshake) = self.reader.next()?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "peer terminated connection",
@@ -409,6 +409,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 && auth_response.is_empty()
                 && handshake.auth_plugin != auth_plugin_expect.as_bytes()
             {
+                self.writer.set_seq(seq + 1);
                 self.writer.write_all(&[0xfe])?;
                 self.writer.write_all(auth_plugin_expect.as_bytes())?;
                 self.writer.write_all(&[0x00])?;
@@ -417,13 +418,14 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
 
                 self.writer.flush()?;
                 {
-                    let (_seq, auth_response_data) = self.reader.next()?.ok_or_else(|| {
+                    let (rseq, auth_response_data) = self.reader.next()?.ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::ConnectionAborted,
                             "peer terminated connection",
                         )
                     })?;
 
+                    seq = rseq;
                     auth_response = auth_response_data.to_vec();
                 }
             }
