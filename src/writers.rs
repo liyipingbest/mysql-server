@@ -119,7 +119,7 @@ where
         w.write_all(&[0x00, 0x00])?; // unused
 
         if is_com_field_list {
-            w.write(&[0xfb])?;
+            w.write_all(&[0xfb])?;
         }
         w.end_packet()?;
     }
