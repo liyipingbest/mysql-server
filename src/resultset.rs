@@ -372,17 +372,21 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
         if complete {
             if self.columns.is_empty() {
                 // response to no column query is always an OK packet
-                let mut resp = OkResponse::default();
-                resp.info = extra_info.to_string();
+                let resp = OkResponse {
+                    info: extra_info.to_string(),
+                    ..Default::default()
+                };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else if self
                 .client_capabilities
                 .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
             {
                 // response to no column query is always an OK packet
-                let mut resp = OkResponse::default();
-                resp.info = extra_info.to_string();
-                resp.header = 0xfe;
+                let resp = OkResponse {
+                    info: extra_info.to_string(),
+                    header: 0xfe,
+                    ..Default::default()
+                };
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
                 // we wrote out at least one row

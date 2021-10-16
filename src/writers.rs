@@ -80,8 +80,13 @@ where
     w.write_u16::<LittleEndian>(0)?; // number of warnings
     w.end_packet()?;
 
-    write_column_definitions_41(pi, w, client_capabilities)?;
-    write_column_definitions_41(ci, w, client_capabilities)
+    if pi.len() > 0 {
+        write_column_definitions_41(pi, w, client_capabilities, false)?;
+    }
+    if ci.len() > 0 {
+        write_column_definitions_41(ci, w, client_capabilities, false)?;
+    }
+    Ok(())
 }
 
 /// works for Protocol::ColumnDefinition41 is set
@@ -90,12 +95,12 @@ pub(crate) fn write_column_definitions_41<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,
     client_capabilities: CapabilityFlags,
+    is_com_field_list: bool,
 ) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Column>,
     W: Write,
 {
-    let mut empty = true;
     for c in i {
         let c = c.borrow();
         use crate::myc::constants::UTF8_GENERAL_CI;
@@ -113,11 +118,13 @@ where
         w.write_all(&[0x00])?; // decimals
         w.write_all(&[0x00, 0x00])?; // unused
 
+        if is_com_field_list {
+            w.write_all(&[0xfb])?;
+        }
         w.end_packet()?;
-        empty = false;
     }
 
-    if !empty && !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+    if !client_capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
         write_eof_packet(w, StatusFlags::empty())
     } else {
         Ok(())
@@ -137,5 +144,5 @@ where
     let i = i.into_iter();
     w.write_lenenc_int(i.len() as u64)?;
     w.end_packet()?;
-    write_column_definitions_41(i, w, client_capabilities)
+    write_column_definitions_41(i, w, client_capabilities, false)
 }

@@ -325,7 +325,6 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 | CapabilityFlags::CLIENT_PLUGIN_AUTH
                 | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
                 | CapabilityFlags::CLIENT_CONNECT_WITH_DB
-                | CapabilityFlags::CLIENT_RESERVED
                 | CapabilityFlags::CLIENT_DEPRECATE_EOF
             // | CapabilityFlags::CLIENT_SSL
         )
@@ -594,6 +593,16 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                         cols,
                         &mut self.writer,
                         self.client_capabilities,
+                        true,
+                    )?;
+                    let ok_packet = OkResponse {
+                        header: 0xfe,
+                        ..Default::default()
+                    };
+                    writers::write_ok_packet(
+                        &mut self.writer,
+                        self.client_capabilities,
+                        ok_packet,
                     )?;
                 }
                 Command::Init(schema) => {
