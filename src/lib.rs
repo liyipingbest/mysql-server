@@ -400,6 +400,17 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 })?
                 .1;
 
+            if !handshake
+                .capabilities
+                .contains(CapabilityFlags::CLIENT_PROTOCOL_41)
+            {
+                let err = io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Required capability: CLIENT_PROTOCOL_41, please upgrade your MySQL client version",
+                );
+                return Err(err.into());
+            }
+
             self.client_capabilities = handshake.capabilities;
             let mut auth_response = handshake.auth_response.clone();
             let auth_plugin_expect = self.shim.auth_plugin_for_username(&handshake.username);
@@ -579,10 +590,9 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                         colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
                     }];
-                    writers::write_column_definitions(
+                    writers::write_column_definitions_41(
                         cols,
                         &mut self.writer,
-                        true,
                         self.client_capabilities,
                     )?;
                 }

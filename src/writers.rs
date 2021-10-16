@@ -80,14 +80,15 @@ where
     w.write_u16::<LittleEndian>(0)?; // number of warnings
     w.end_packet()?;
 
-    write_column_definitions(pi, w, false, client_capabilities)?;
-    write_column_definitions(ci, w, false, client_capabilities)
+    write_column_definitions_41(pi, w, client_capabilities)?;
+    write_column_definitions_41(ci, w, client_capabilities)
 }
 
-pub(crate) fn write_column_definitions<'a, I, W>(
+/// works for Protocol::ColumnDefinition41 is set
+/// see: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_column_definition.html
+pub(crate) fn write_column_definitions_41<'a, I, W>(
     i: I,
     w: &mut PacketWriter<W>,
-    is_comm_field_list_response: bool,
     client_capabilities: CapabilityFlags,
 ) -> io::Result<()>
 where
@@ -111,13 +112,6 @@ where
         w.write_u16::<LittleEndian>(c.colflags.bits())?;
         w.write_all(&[0x00])?; // decimals
         w.write_all(&[0x00, 0x00])?; // unused
-
-        if is_comm_field_list_response {
-            // We should write length encoded int with string size
-            // followed by string with some "default values" (possibly it's column defaults).
-            // But we just send NULL for simplicity
-            w.write_u8(0xfb)?;
-        }
 
         w.end_packet()?;
         empty = false;
@@ -143,5 +137,5 @@ where
     let i = i.into_iter();
     w.write_lenenc_int(i.len() as u64)?;
     w.end_packet()?;
-    write_column_definitions(i, w, false, client_capabilities)
+    write_column_definitions_41(i, w, client_capabilities)
 }
