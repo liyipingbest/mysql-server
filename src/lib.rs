@@ -256,10 +256,17 @@ pub trait MysqlShim<W: Write> {
     }
 }
 
+/// The options which passed to MysqlIntermediary struct
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MysqlIntermediaryOptions {
+    process_use_statement_on_query: bool,
+}
+
 /// A server that speaks the MySQL/MariaDB protocol, and can delegate client commands to a backend
 /// that implements [`MysqlShim`](trait.MysqlShim.html).
 pub struct MysqlIntermediary<B, R: Read, W: Write> {
     pub(crate) client_capabilities: CapabilityFlags,
+    process_use_statement_on_query: bool,
     shim: B,
     reader: packet::PacketReader<R>,
     writer: packet::PacketWriter<W>,
@@ -273,6 +280,17 @@ impl<B: MysqlShim<net::TcpStream>> MysqlIntermediary<B, net::TcpStream, net::Tcp
         let w = stream.try_clone()?;
         MysqlIntermediary::run_on(shim, stream, w)
     }
+
+    /// Create a new server over a TCP stream and process client commands until the client
+    /// disconnects or an error occurs. See also
+    pub fn run_on_tcp_with_options(
+        shim: B,
+        stream: net::TcpStream,
+        opts: &MysqlIntermediaryOptions,
+    ) -> Result<(), B::Error> {
+        let w = stream.try_clone()?;
+        MysqlIntermediary::run_with_options(shim, stream, w, opts)
+    }
 }
 
 impl<B: MysqlShim<S>, S: Read + Write + Clone> MysqlIntermediary<B, S, S> {
@@ -281,6 +299,16 @@ impl<B: MysqlShim<S>, S: Read + Write + Clone> MysqlIntermediary<B, S, S> {
     /// [`MysqlIntermediary::run_on`](struct.MysqlIntermediary.html#method.run_on).
     pub fn run_on_stream(shim: B, stream: S) -> Result<(), B::Error> {
         MysqlIntermediary::run_on(shim, stream.clone(), stream)
+    }
+
+    /// Create a new server over a two-way stream and process client commands until the client
+    /// disconnects or an error ocurrs.
+    pub fn run_on_stream_with_options(
+        shim: B,
+        stream: S,
+        opts: &MysqlIntermediaryOptions,
+    ) -> Result<(), B::Error> {
+        MysqlIntermediary::run_with_options(shim, stream.clone(), stream, opts)
     }
 }
 
@@ -296,10 +324,22 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
     /// Create a new server over two one-way channels and process client commands until the client
     /// disconnects or an error occurs.
     pub fn run_on(shim: B, reader: R, writer: W) -> Result<(), B::Error> {
+        Self::run_with_options(shim, reader, writer, &Default::default())
+    }
+
+    /// Create a new server over two one-way channels and process client commands until the client
+    /// disconnects or an error occurs, with config options.
+    pub fn run_with_options(
+        shim: B,
+        reader: R,
+        writer: W,
+        opts: &MysqlIntermediaryOptions,
+    ) -> Result<(), B::Error> {
         let r = packet::PacketReader::new(reader);
         let w = packet::PacketWriter::new(writer);
         let mut mi = MysqlIntermediary {
             client_capabilities: CapabilityFlags::from_bits_truncate(0),
+            process_use_statement_on_query: opts.process_use_statement_on_query,
             shim,
             reader: r,
             writer: w,
@@ -510,7 +550,9 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                                 w.finish()?;
                             }
                         }
-                    } else if q.starts_with(b"USE ") || q.starts_with(b"use ") {
+                    } else if !self.process_use_statement_on_query
+                        && (q.starts_with(b"USE ") || q.starts_with(b"use "))
+                    {
                         let w = InitWriter {
                             client_capabilities: self.client_capabilities,
                             writer: &mut self.writer,

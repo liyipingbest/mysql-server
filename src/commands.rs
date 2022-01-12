@@ -2,9 +2,12 @@ use crate::myc::constants::{CapabilityFlags, Command as CommandByte};
 
 #[derive(Debug)]
 pub struct ClientHandshake {
+    #[allow(dead_code)]
     maxps: u32,
     pub(crate) capabilities: CapabilityFlags,
+    #[allow(dead_code)]
     pub(crate) collation: u16,
+    #[allow(dead_code)]
     pub(crate) db: Option<Vec<u8>>,
     pub(crate) username: Vec<u8>,
     pub(crate) auth_response: Vec<u8>,
