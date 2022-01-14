@@ -285,6 +285,7 @@ mod tests {
     use crate::value::utils::tests::WriteMysqlExt;
     use crate::{Column, ColumnFlags, ColumnType};
     use chrono::{self, TimeZone};
+    use myc::proto::MySerialize;
     use std::time;
 
     macro_rules! rt {
@@ -307,7 +308,7 @@ mod tests {
                 }
 
                 let v: $t = $v;
-                data.write_bin_value(&myc::value::Value::from(v)).unwrap();
+                myc::value::Value::from(v).serialize(&mut data);
                 assert_eq!(
                     Into::<$t>::into(Value::parse_from(&mut &data[..], $ct, !$sig).unwrap()),
                     v
