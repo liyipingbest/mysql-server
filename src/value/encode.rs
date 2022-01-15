@@ -685,7 +685,7 @@ mod tests {
                     let mut data = Vec::new();
                     let v: $t = $v;
                     v.to_mysql_text(&mut data).unwrap();
-                    let mut pb = ParseBuf(&mut data[..]);
+                    let mut pb = ParseBuf(&data[..]);
                     assert_eq!(
                         <$t>::from_value(
                             ValueDeserializer::<TextValue>::deserialize((), &mut pb)
@@ -768,7 +768,7 @@ mod tests {
 
                     let v: $t = $v;
                     v.to_mysql_bin(&mut data, &col).unwrap();
-                    let mut pb = ParseBuf(&mut data[..]);
+                    let mut pb = ParseBuf(&data[..]);
                     assert_eq!(
                         <$t>::from_value(
                             ValueDeserializer::<BinValue>::deserialize(

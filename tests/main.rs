@@ -93,7 +93,7 @@ where
 
     fn test<C>(self, c: C)
     where
-        C: FnOnce(&mut mysql::Conn) -> (),
+        C: FnOnce(&mut mysql::Conn),
     {
         let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -134,7 +134,7 @@ fn it_inits_ok() {
             writer.ok()
         },
     )
-    .test(|db| assert_eq!(true, db.select_db("test")));
+    .test(|db| assert!(db.select_db("test")));
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn it_inits_error() {
             )
         },
     )
-    .test(|db| assert_eq!(false, db.select_db("test")));
+    .test(|db| assert!(!db.select_db("test")));
 }
 
 #[test]
@@ -165,10 +165,7 @@ fn it_inits_on_use_query_ok() {
             writer.ok()
         },
     )
-    .test(|db| match db.query_drop("USE `test`;") {
-        Ok(_) => assert!(true),
-        Err(_) => assert!(false),
-    });
+    .test(|db| assert!(db.query_drop("USE `test`;").is_ok()));
 }
 
 #[test]
@@ -179,7 +176,7 @@ fn it_pings() {
         |_, _, _| unreachable!(),
         |_, _| unreachable!(),
     )
-    .test(|db| assert_eq!(db.ping(), true))
+    .test(|db| assert!(db.ping()))
 }
 
 #[test]
@@ -609,9 +606,11 @@ fn insert_exec() {
             assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
             assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
 
-            let mut info = OkResponse::default();
-            info.affected_rows = 42;
-            info.last_insert_id = 1;
+            let info = OkResponse {
+                affected_rows: 42,
+                last_insert_id: 1,
+                ..Default::default()
+            };
             w.completed(info)
         },
         |_, _| unreachable!(),
@@ -750,7 +749,7 @@ fn prepared_empty() {
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
     }];
-    let cols2 = cols.clone();
+    let cols2 = cols;
     let params = vec![Column {
         table: String::new(),
         column: "c".to_owned(),
