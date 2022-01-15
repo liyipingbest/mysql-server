@@ -3,12 +3,12 @@ use std::net;
 use std::thread;
 
 use msql_srv::OkResponse;
-use mysql::prelude::*;
-use mysql_common as myc;
 use msql_srv::{
     Column, ErrorKind, InitWriter, MysqlIntermediary, MysqlShim, ParamParser, QueryResultWriter,
     StatementMetaWriter,
 };
+use mysql::prelude::*;
+use mysql_common as myc;
 
 struct TestingShim<Q, P, E, I> {
     columns: Vec<Column>,
