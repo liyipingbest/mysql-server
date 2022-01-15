@@ -2,18 +2,13 @@
 //! a MySQL database. To try this out, start a PostgreSQL database at localhost:5432, and then run
 //! this example. Notice that `main` does *not* use PostgreSQL bindings, just MySQL ones!
 
-extern crate msql_srv;
-extern crate mysql;
-extern crate postgres;
-extern crate slab;
+use std::io;
+use std::net;
+use std::thread;
 
 use msql_srv::*;
 use mysql::prelude::*;
 use slab::Slab;
-
-use std::io;
-use std::net;
-use std::thread;
 
 fn main() {
     let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();

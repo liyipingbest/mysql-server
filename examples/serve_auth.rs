@@ -5,17 +5,16 @@
 //! $
 //! ```
 
-extern crate msql_srv;
-extern crate mysql;
-extern crate mysql_common as myc;
-
-use msql_srv::*;
 use std::io;
 use std::iter;
 use std::net;
 use std::thread;
 
+use msql_srv::*;
+use mysql_common as myc;
+
 struct Backend;
+
 impl<W: io::Write> MysqlShim<W> for Backend {
     type Error = io::Error;
 

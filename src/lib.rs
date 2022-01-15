@@ -13,8 +13,6 @@
 //! all commands with a "no results" reply:
 //!
 //! ```
-//! # extern crate msql_srv;
-//! extern crate mysql;
 //! # use std::io;
 //! # use std::net;
 //! # use std::thread;
@@ -84,7 +82,6 @@
 //! }
 //! ```
 #![deny(missing_docs)]
-#![deny(rust_2018_idioms)]
 #![allow(clippy::from_over_into)]
 
 // Note to developers: you can find decent overviews of the protocol at
@@ -114,6 +111,9 @@ mod params;
 mod resultset;
 mod value;
 mod writers;
+
+#[cfg(test)]
+mod tests;
 
 /// Meta-information abot a single column, used either to describe a prepared statement parameter
 /// or an output column.

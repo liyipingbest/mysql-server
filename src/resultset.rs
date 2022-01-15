@@ -1,12 +1,14 @@
-use crate::myc::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::io::{self, Write};
+
+use byteorder::WriteBytesExt;
+use mysql_common::constants::{CapabilityFlags, ColumnFlags, StatusFlags};
+
 use crate::packet::PacketWriter;
 use crate::value::ToMysqlValue;
 use crate::{writers, OkResponse};
 use crate::{Column, ErrorKind, StatementData};
-use byteorder::WriteBytesExt;
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::io::{self, Write};
 
 /// Convenience type for responding to a client `USE <db>` command.
 pub struct InitWriter<'a, W: Write> {

@@ -1,9 +1,6 @@
 // https://mariadb.com/kb/en/library/mariadb-error-codes/
 // Generated using:
 /*
-extern crate reqwest;
-extern crate select;
-
 use std::io::Read;
 use select::document::Document;
 use select::predicate::{Child, Class, Name};

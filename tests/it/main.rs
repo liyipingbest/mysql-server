@@ -1,36 +1,30 @@
-extern crate chrono;
-extern crate futures;
-extern crate msql_srv;
-extern crate mysql_async;
-extern crate mysql_common as myc;
-extern crate nom;
-extern crate tokio;
-
-use futures::{Future, IntoFuture};
-use msql_srv::OkResponse;
-use mysql_async::prelude::*;
 use std::io;
 use std::net;
 use std::thread;
 
+use msql_srv::OkResponse;
 use msql_srv::{
-    Column, ErrorKind, MysqlIntermediary, MysqlShim, ParamParser, QueryResultWriter,
+    Column, ErrorKind, InitWriter, MysqlIntermediary, MysqlShim, ParamParser, QueryResultWriter,
     StatementMetaWriter,
 };
+use mysql::prelude::*;
+use mysql_common as myc;
 
-struct TestingShim<Q, P, E> {
+struct TestingShim<Q, P, E, I> {
     columns: Vec<Column>,
     params: Vec<Column>,
     on_q: Q,
     on_p: P,
     on_e: E,
+    on_i: I,
 }
 
-impl<Q, P, E> MysqlShim<net::TcpStream> for TestingShim<Q, P, E>
+impl<Q, P, E, I> MysqlShim<net::TcpStream> for TestingShim<Q, P, E, I>
 where
     Q: FnMut(&str, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
     P: FnMut(&str) -> u32,
     E: FnMut(u32, Vec<msql_srv::ParamValue>, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
+    I: FnMut(&str, InitWriter<net::TcpStream>) -> io::Result<()>,
 {
     type Error = io::Error;
 
@@ -54,6 +48,10 @@ where
 
     fn on_close(&mut self, _: u32) {}
 
+    fn on_init(&mut self, schema: &str, writer: InitWriter<net::TcpStream>) -> io::Result<()> {
+        (self.on_i)(schema, writer)
+    }
+
     fn on_query(
         &mut self,
         query: &str,
@@ -63,21 +61,23 @@ where
     }
 }
 
-impl<Q, P, E> TestingShim<Q, P, E>
+impl<Q, P, E, I> TestingShim<Q, P, E, I>
 where
     Q: 'static + Send + FnMut(&str, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
     P: 'static + Send + FnMut(&str) -> u32,
     E: 'static
         + Send
         + FnMut(u32, Vec<msql_srv::ParamValue>, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
+    I: 'static + Send + FnMut(&str, InitWriter<net::TcpStream>) -> io::Result<()>,
 {
-    fn new(on_q: Q, on_p: P, on_e: E) -> Self {
+    fn new(on_q: Q, on_p: P, on_e: E, on_i: I) -> Self {
         TestingShim {
             columns: Vec::new(),
             params: Vec::new(),
             on_q,
             on_p,
             on_e,
+            on_i,
         }
     }
 
@@ -91,10 +91,9 @@ where
         self
     }
 
-    fn test<C, F>(self, c: C)
+    fn test<C>(self, c: C)
     where
-        F: IntoFuture<Item = (), Error = mysql_async::error::Error>,
-        C: FnOnce(mysql_async::Conn) -> F + Send + Sync + 'static,
+        C: FnOnce(&mut mysql::Conn),
     {
         let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -103,15 +102,12 @@ where
             MysqlIntermediary::run_on_tcp(self, s)
         });
 
-        // Create the runtime
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        rt.spawn_blocking(move || {
-            mysql_async::Conn::new(format!("mysql://127.0.0.1:{}", port))
-                .and_then(|conn| c(conn))
-                .wait()
-        });
-
+        let mut db = mysql::Conn::new(
+            mysql::Opts::from_url(&format!("mysql://127.0.0.1:{}", port)).unwrap(),
+        )
+        .unwrap();
+        c(&mut db);
+        drop(db);
         jh.join().unwrap().unwrap();
     }
 }
@@ -122,8 +118,54 @@ fn it_connects() {
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
-    .test(|_| Ok(()))
+    .test(|_| {})
+}
+
+#[test]
+fn it_inits_ok() {
+    TestingShim::new(
+        |_, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+        |schema, writer| {
+            assert_eq!(schema, "test");
+            writer.ok()
+        },
+    )
+    .test(|db| assert!(db.select_db("test")));
+}
+
+#[test]
+fn it_inits_error() {
+    TestingShim::new(
+        |_, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+        |schema, writer| {
+            assert_eq!(schema, "test");
+            writer.error(
+                ErrorKind::ER_BAD_DB_ERROR,
+                format!("Database {} not found", schema).as_bytes(),
+            )
+        },
+    )
+    .test(|db| assert!(!db.select_db("test")));
+}
+
+#[test]
+fn it_inits_on_use_query_ok() {
+    TestingShim::new(
+        |_, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+        |schema, writer| {
+            assert_eq!(schema, "test");
+            writer.ok()
+        },
+    )
+    .test(|db| assert!(db.query_drop("USE `test`;").is_ok()));
 }
 
 #[test]
@@ -132,8 +174,9 @@ fn it_pings() {
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
-    .test(|db| db.ping().map(|_| ()))
+    .test(|db| assert!(db.ping()))
 }
 
 #[test]
@@ -142,14 +185,10 @@ fn empty_response() {
         |_, w| w.completed(OkResponse::default()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.query_iter("SELECT a, b FROM foo").unwrap().count(), 0);
     })
 }
 
@@ -165,14 +204,10 @@ fn no_rows() {
         move |_, w| w.start(&cols[..])?.finish(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.query_iter("SELECT a, b FROM foo").unwrap().count(), 0);
     })
 }
 
@@ -182,14 +217,10 @@ fn no_columns() {
         move |_, w| w.start(&[])?.finish(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.query_iter("SELECT a, b FROM foo").unwrap().count(), 0);
     })
 }
 
@@ -199,29 +230,11 @@ fn no_columns_but_rows() {
         move |_, w| w.start(&[])?.write_col(42).map(|_| ()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.query_iter("SELECT a, b FROM foo").unwrap().count(), 0);
     })
-}
-
-#[test]
-fn really_long_query() {
-    let long = "CREATE TABLE `stories` (`id` int unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, `always_null` int, `created_at` datetime, `user_id` int unsigned, `url` varchar(250) DEFAULT '', `title` varchar(150) DEFAULT '' NOT NULL, `description` mediumtext, `short_id` varchar(6) DEFAULT '' NOT NULL, `is_expired` tinyint(1) DEFAULT 0 NOT NULL, `is_moderated` tinyint(1) DEFAULT 0 NOT NULL, `markeddown_description` mediumtext, `story_cache` mediumtext, `merged_story_id` int, `unavailable_at` datetime, `twitter_id` varchar(20), `user_is_author` tinyint(1) DEFAULT 0,  INDEX `index_stories_on_created_at`  (`created_at`), fulltext INDEX `index_stories_on_description`  (`description`),   INDEX `is_idxes`  (`is_expired`, `is_moderated`),  INDEX `index_stories_on_is_expired`  (`is_expired`),  INDEX `index_stories_on_is_moderated`  (`is_moderated`),  INDEX `index_stories_on_merged_story_id`  (`merged_story_id`), UNIQUE INDEX `unique_short_id`  (`short_id`), fulltext INDEX `index_stories_on_story_cache`  (`story_cache`), fulltext INDEX `index_stories_on_title`  (`title`),  INDEX `index_stories_on_twitter_id`  (`twitter_id`),  INDEX `url`  (`url`(191)),  INDEX `index_stories_on_user_id`  (`user_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
-    TestingShim::new(
-        move |q, w| {
-            assert_eq!(q, long);
-            w.start(&[])?.write_col(42).map(|_| ())
-        },
-        |_| unreachable!(),
-        |_, _, _| unreachable!(),
-    )
-    .test(move |db| db.drop_query(long).map(|_| ()))
 }
 
 #[test]
@@ -231,30 +244,59 @@ fn error_response() {
         move |_, w| w.error(err.0, err.1.as_bytes()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
-    .test(move |db| {
-        db.query("SELECT a, b FROM foo").then(move |r| {
-            match r {
-                Ok(_) => assert!(false),
-                Err(mysql_async::error::Error::Server(mysql_async::error::ServerError {
-                    code,
-                    message: ref msg,
-                    ref state,
-                })) => {
-                    assert_eq!(
-                        state,
-                        &String::from_utf8(err.0.sqlstate().to_vec()).unwrap()
-                    );
-                    assert_eq!(code, err.0 as u16);
-                    assert_eq!(msg, &err.1);
+    .test(|db| {
+        if let mysql::Error::MySqlError(e) = db.query_iter("SELECT a, b FROM foo").unwrap_err() {
+            assert_eq!(
+                e,
+                mysql::error::MySqlError {
+                    state: String::from_utf8(err.0.sqlstate().to_vec()).unwrap(),
+                    message: err.1.to_owned(),
+                    code: err.0 as u16,
                 }
-                Err(e) => {
-                    eprintln!("unexpected {:?}", e);
-                    assert!(false);
+            );
+        } else {
+            unreachable!();
+        }
+    })
+}
+
+#[test]
+fn error_in_result_set_response() {
+    let err = (ErrorKind::ER_NO, "clearly not");
+    TestingShim::new(
+        move |_, w| {
+            let cols = &[Column {
+                table: String::new(),
+                column: "a".to_owned(),
+                coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
+                colflags: myc::constants::ColumnFlags::empty(),
+            }];
+            let mut w = w.start(cols)?;
+            w.write_col(1024)?;
+            w.finish_error(err.0, &err.1.as_bytes())
+        },
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
+    )
+    .test(|db| {
+        let mut result = db.query_iter("SELECT a FROM foo").unwrap();
+        let row1 = result.next().unwrap().unwrap().get::<i16, _>(0).unwrap();
+        assert_eq!(row1, 1024);
+        if let mysql::Error::MySqlError(e) = result.by_ref().next().unwrap().unwrap_err() {
+            assert_eq!(
+                e,
+                mysql::error::MySqlError {
+                    state: String::from_utf8(err.0.sqlstate().to_vec()).unwrap(),
+                    message: err.1.to_owned(),
+                    code: err.0 as u16,
                 }
-            }
-            Ok(())
-        })
+            );
+        } else {
+            unreachable!()
+        }
     })
 }
 
@@ -270,14 +312,10 @@ fn empty_on_drop() {
         move |_, w| w.start(&cols[..]).map(|_| ()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.query_iter("SELECT a, b FROM foo").unwrap().count(), 0);
     })
 }
 
@@ -297,16 +335,16 @@ fn it_queries_nulls() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 1);
-                assert_eq!(rs[0].len(), 1);
-                assert_eq!(rs[0][0], mysql_async::Value::NULL);
-                Ok(())
-            })
+        let row = db
+            .query_iter("SELECT a, b FROM foo")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.as_ref(0), Some(&mysql::Value::NULL));
     })
 }
 
@@ -326,16 +364,59 @@ fn it_queries() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 1);
-                assert_eq!(rs[0].len(), 1);
-                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-                Ok(())
-            })
+        let row = db
+            .query_iter("SELECT a, b FROM foo")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i16, _>(0), Some(1024));
+    })
+}
+
+#[test]
+fn multi_result() {
+    TestingShim::new(
+        |_, w| {
+            let cols = &[Column {
+                table: String::new(),
+                column: "a".to_owned(),
+                coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
+                colflags: myc::constants::ColumnFlags::empty(),
+            }];
+            let mut row = w.start(cols)?;
+            row.write_col(1024i16)?;
+            let w = row.finish_one()?;
+            let mut row = w.start(cols)?;
+            row.write_col(1025i16)?;
+            row.finish()
+        },
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
+    )
+    .test(|db| {
+        let mut result = db
+            .query_iter("SELECT a FROM foo; SELECT a FROM foo")
+            .unwrap();
+        let mut set = result.iter().unwrap();
+        let row1: Vec<_> = set
+            .by_ref()
+            .filter_map(|row| row.unwrap().get::<i16, _>(0))
+            .collect();
+        assert_eq!(row1, vec![1024]);
+        drop(set);
+        let mut set = result.iter().unwrap();
+        let row2: Vec<_> = set
+            .by_ref()
+            .filter_map(|row| row.unwrap().get::<i16, _>(0))
+            .collect();
+        assert_eq!(row2, vec![1025]);
+        drop(set);
+        assert!(result.iter().is_none());
     })
 }
 
@@ -366,20 +447,17 @@ fn it_queries_many_rows() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.query("SELECT a, b FROM foo")
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 2);
-                assert_eq!(rs[0].len(), 2);
-                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-                assert_eq!(rs[0].get::<i16, _>(1), Some(1025));
-                assert_eq!(rs[1].len(), 2);
-                assert_eq!(rs[1].get::<i16, _>(0), Some(1024));
-                assert_eq!(rs[1].get::<i16, _>(1), Some(1025));
-                Ok(())
-            })
+        let mut rows = 0;
+        for row in db.query_iter("SELECT a, b FROM foo").unwrap() {
+            let row = row.unwrap();
+            assert_eq!(row.get::<i16, _>(0), Some(1024));
+            assert_eq!(row.get::<i16, _>(1), Some(1025));
+            rows += 1;
+        }
+        assert_eq!(rows, 2);
     })
 }
 
@@ -419,18 +497,18 @@ fn it_prepares() {
             w.write_col(1024i16)?;
             w.finish()
         },
+        |_, _| unreachable!(),
     )
     .with_params(params)
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec("SELECT a FROM b WHERE c = ?", (42i16,))
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 1);
-                assert_eq!(rs[0].len(), 1);
-                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-                Ok(())
-            })
+        let row = db
+            .exec_iter("SELECT a FROM b WHERE c = ?", (42i16,))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i16, _>(0), Some(1024i16));
     })
 }
 
@@ -528,34 +606,36 @@ fn insert_exec() {
             assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
             assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
 
-            let mut info = OkResponse::default();
-            info.affected_rows = 42;
-            info.last_insert_id = 1;
+            let info = OkResponse {
+                affected_rows: 42,
+                last_insert_id: 1,
+                ..Default::default()
+            };
             w.completed(info)
         },
+        |_, _| unreachable!(),
     )
     .with_params(params)
     .test(|db| {
-        db.prep_exec(
-            "INSERT INTO `users` \
-             (`username`, `email`, `password_digest`, `created_at`, \
-             `session_token`, `rss_token`, `mailing_list_token`) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                "user199",
-                "user199@example.com",
-                "$2a$10$Tq3wrGeC0xtgzuxqOlc3v.07VTUvxvwI70kuoVihoO2cE5qj7ooka",
-                mysql_async::Value::Date(2018, 4, 6, 13, 0, 56, 0),
-                "token199",
-                "rsstoken199",
-                "mtok199",
-            ),
-        )
-        .and_then(|res| {
-            assert_eq!(res.affected_rows(), 42);
-            assert_eq!(res.last_insert_id(), Some(1));
-            Ok(())
-        })
+        let res = db
+            .exec_iter(
+                "INSERT INTO `users` \
+                 (`username`, `email`, `password_digest`, `created_at`, \
+                 `session_token`, `rss_token`, `mailing_list_token`) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "user199",
+                    "user199@example.com",
+                    "$2a$10$Tq3wrGeC0xtgzuxqOlc3v.07VTUvxvwI70kuoVihoO2cE5qj7ooka",
+                    mysql::Value::Date(2018, 4, 6, 13, 0, 56, 0),
+                    "token199",
+                    "rsstoken199",
+                    "mtok199",
+                ),
+            )
+            .unwrap();
+        assert_eq!(res.affected_rows(), 42);
+        assert_eq!(res.last_insert_id(), Some(1));
     })
 }
 
@@ -595,18 +675,18 @@ fn send_long() {
             w.write_col(1024i16)?;
             w.finish()
         },
+        |_, _| unreachable!(),
     )
     .with_params(params)
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec("SELECT a FROM b WHERE c = ?", (b"Hello world",))
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 1);
-                assert_eq!(rs[0].len(), 1);
-                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-                Ok(())
-            })
+        let row = db
+            .exec_iter("SELECT a FROM b WHERE c = ?", (b"Hello world",))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get::<i16, _>(0), Some(1024i16));
     })
 }
 
@@ -645,22 +725,19 @@ fn it_prepares_many() {
             w.write_row(&[1024i16, 1025i16])?;
             w.finish()
         },
+        |_, _| unreachable!(),
     )
     .with_params(Vec::new())
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec("SELECT a, b FROM x", ())
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 2);
-                assert_eq!(rs[0].len(), 2);
-                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-                assert_eq!(rs[0].get::<i16, _>(1), Some(1025));
-                assert_eq!(rs[1].len(), 2);
-                assert_eq!(rs[1].get::<i16, _>(0), Some(1024));
-                assert_eq!(rs[1].get::<i16, _>(1), Some(1025));
-                Ok(())
-            })
+        let mut rows = 0;
+        for row in db.exec_iter("SELECT a, b FROM x", ()).unwrap() {
+            let row = row.unwrap();
+            assert_eq!(row.get::<i16, _>(0), Some(1024));
+            assert_eq!(row.get::<i16, _>(1), Some(1025));
+            rows += 1;
+        }
+        assert_eq!(rows, 2);
     })
 }
 
@@ -672,7 +749,7 @@ fn prepared_empty() {
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
     }];
-    let cols2 = cols.clone();
+    let cols2 = cols;
     let params = vec![Column {
         table: String::new(),
         column: "c".to_owned(),
@@ -687,16 +764,17 @@ fn prepared_empty() {
             assert!(!params.is_empty());
             w.completed(OkResponse::default())
         },
+        |_, _| unreachable!(),
     )
     .with_params(params)
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec("SELECT a FROM b WHERE c = ?", (42i16,))
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(
+            db.exec_iter("SELECT a FROM b WHERE c = ?", (42i16,))
+                .unwrap()
+                .count(),
+            0
+        );
     })
 }
 
@@ -720,18 +798,13 @@ fn prepared_no_params() {
             w.write_col(1024i16)?;
             w.finish()
         },
+        |_, _| unreachable!(),
     )
     .with_params(params)
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec("foo", ())
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 1);
-                assert_eq!(rs[0].len(), 1);
-                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-                Ok(())
-            })
+        let row = db.exec_iter("foo", ()).unwrap().next().unwrap().unwrap();
+        assert_eq!(row.get::<i16, _>(0), Some(1024i16));
     })
 }
 
@@ -776,7 +849,7 @@ fn prepared_nulls() {
             assert!(!params[1].value.is_null());
             assert_eq!(
                 params[0].coltype,
-                myc::constants::ColumnType::MYSQL_TYPE_SHORT
+                myc::constants::ColumnType::MYSQL_TYPE_NULL
             );
             // rust-mysql sends all numbers as LONGLONG :'(
             assert_eq!(
@@ -789,22 +862,22 @@ fn prepared_nulls() {
             w.write_row(vec![None::<i16>, Some(42)])?;
             w.finish()
         },
+        |_, _| unreachable!(),
     )
     .with_params(params)
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec(
-            "SELECT a, b FROM x WHERE c = ? AND d = ?",
-            (mysql_async::Value::NULL, 42),
-        )
-        .and_then(|r| r.collect::<mysql_async::Row>())
-        .and_then(|(_, rs)| {
-            assert_eq!(rs.len(), 1);
-            assert_eq!(rs[0].len(), 2);
-            assert_eq!(rs[0].get::<Option<i16>, _>(0), Some(None));
-            assert_eq!(rs[0].get::<i16, _>(1), Some(42));
-            Ok(())
-        })
+        let row = db
+            .exec_iter(
+                "SELECT a, b FROM x WHERE c = ? AND d = ?",
+                (mysql::Value::NULL, 42),
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.as_ref(0), Some(&mysql::Value::NULL));
+        assert_eq!(row.get::<i16, _>(1), Some(42));
     })
 }
 
@@ -821,15 +894,11 @@ fn prepared_no_rows() {
         |_, _| unreachable!(),
         |_| 0,
         move |_, _, w| w.start(&cols[..])?.finish(),
+        |_, _| unreachable!(),
     )
     .with_columns(cols2)
     .test(|db| {
-        db.prep_exec("SELECT a, b FROM foo", ())
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.exec_iter("SELECT a, b FROM foo", ()).unwrap().count(), 0);
     })
 }
 
@@ -839,14 +908,10 @@ fn prepared_no_cols_but_rows() {
         |_, _| unreachable!(),
         |_| 0,
         move |_, _, w| w.start(&[])?.write_col(42).map(|_| ()),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.prep_exec("SELECT a, b FROM foo", ())
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.exec_iter("SELECT a, b FROM foo", ()).unwrap().count(), 0);
     })
 }
 
@@ -856,13 +921,26 @@ fn prepared_no_cols() {
         |_, _| unreachable!(),
         |_| 0,
         move |_, _, w| w.start(&[])?.finish(),
+        |_, _| unreachable!(),
     )
     .test(|db| {
-        db.prep_exec("SELECT a, b FROM foo", ())
-            .and_then(|r| r.collect::<mysql_async::Row>())
-            .and_then(|(_, rs)| {
-                assert_eq!(rs.len(), 0);
-                Ok(())
-            })
+        assert_eq!(db.exec_iter("SELECT a, b FROM foo", ()).unwrap().count(), 0);
+    })
+}
+
+#[test]
+fn really_long_query() {
+    let long = "CREATE TABLE `stories` (`id` int unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, `always_null` int, `created_at` datetime, `user_id` int unsigned, `url` varchar(250) DEFAULT '', `title` varchar(150) DEFAULT '' NOT NULL, `description` mediumtext, `short_id` varchar(6) DEFAULT '' NOT NULL, `is_expired` tinyint(1) DEFAULT 0 NOT NULL, `is_moderated` tinyint(1) DEFAULT 0 NOT NULL, `markeddown_description` mediumtext, `story_cache` mediumtext, `merged_story_id` int, `unavailable_at` datetime, `twitter_id` varchar(20), `user_is_author` tinyint(1) DEFAULT 0,  INDEX `index_stories_on_created_at`  (`created_at`), fulltext INDEX `index_stories_on_description`  (`description`),   INDEX `is_idxes`  (`is_expired`, `is_moderated`),  INDEX `index_stories_on_is_expired`  (`is_expired`),  INDEX `index_stories_on_is_moderated`  (`is_moderated`),  INDEX `index_stories_on_merged_story_id`  (`merged_story_id`), UNIQUE INDEX `unique_short_id`  (`short_id`), fulltext INDEX `index_stories_on_story_cache`  (`story_cache`), fulltext INDEX `index_stories_on_title`  (`title`),  INDEX `index_stories_on_twitter_id`  (`twitter_id`),  INDEX `url`  (`url`(191)),  INDEX `index_stories_on_user_id`  (`user_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    TestingShim::new(
+        move |q, w| {
+            assert_eq!(q, long);
+            w.start(&[])?.finish()
+        },
+        |_| 0,
+        |_, _, _| unreachable!(),
+        |_, _| unreachable!(),
+    )
+    .test(move |db| {
+        db.query_iter(long).unwrap();
     })
 }
