@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 use crate::myc;
 use crate::{StatementData, Value};
-use std::collections::HashMap;
 
 /// A `ParamParser` decodes query parameters included in a client's `EXECUTE` command given
 /// type information for the expected parameters.
