@@ -61,7 +61,6 @@ pub struct ParamValue<'a> {
 impl<'a> Iterator for Params<'a> {
     type Item = ParamValue<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        use std::convert::TryFrom;
         if self.nullmap.is_none() {
             let nullmap_len = (self.params as usize + 7) / 8;
             let (nullmap, rest) = self.input.split_at(nullmap_len);
