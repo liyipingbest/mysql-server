@@ -1,10 +1,10 @@
-use msql_srv::OkResponse;
-use mysql::prelude::*;
-use mysql_common as myc;
 use std::io;
 use std::net;
 use std::thread;
 
+use msql_srv::OkResponse;
+use mysql::prelude::*;
+use mysql_common as myc;
 use msql_srv::{
     Column, ErrorKind, InitWriter, MysqlIntermediary, MysqlShim, ParamParser, QueryResultWriter,
     StatementMetaWriter,
