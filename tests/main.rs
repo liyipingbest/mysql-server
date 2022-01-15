@@ -1,11 +1,6 @@
-extern crate chrono;
-extern crate msql_srv;
-extern crate mysql;
-extern crate mysql_common as myc;
-extern crate nom;
-
 use msql_srv::OkResponse;
 use mysql::prelude::*;
+use mysql_common as myc;
 use std::io;
 use std::net;
 use std::thread;
