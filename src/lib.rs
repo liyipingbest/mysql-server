@@ -940,6 +940,12 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, S: AsyncRead + AsyncWrite + Unpi
                 self.writer.write_all(&[0x00])?;
 
                 self.writer.flush()?;
+                let buf = self.writer.w.get_mut();
+                self.reader.r.write_all(buf.as_slice()).await?;
+                self.reader.r.flush().await?;
+                buf.truncate(0);
+                self.writer.w.set_position(0);
+                
                 {
                     let (rseq, auth_response_data) =
                         self.reader.next_async().await?.ok_or_else(|| {
@@ -1164,7 +1170,7 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, S: AsyncRead + AsyncWrite + Unpi
                     break;
                 }
             }
-            self.writer.flush()?;
+            self.writer_flush().await?;
         }
         Ok(())
     }
