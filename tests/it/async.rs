@@ -1,16 +1,17 @@
-use std::error::Error;
-use std::future::Future;
 use std::io;
-use std::net;
-use std::thread;
+use std::io::Cursor;
 
+use async_trait::async_trait;
+use futures::{Future, IntoFuture};
 use msql_srv::{
-    Column, ErrorKind, MysqlIntermediary, MysqlShim, OkResponse, ParamParser, QueryResultWriter,
-    StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ErrorKind, OkResponse, ParamParser,
+    QueryResultWriter, StatementMetaWriter,
 };
 use mysql_async::prelude::*;
-use mysql_async::Opts;
 use mysql_common as myc;
+use tokio::net::TcpListener;
+use tokio::task;
+
 struct TestingShim<Q, P, E> {
     columns: Vec<Column>,
     params: Vec<Column>,
@@ -19,50 +20,61 @@ struct TestingShim<Q, P, E> {
     on_e: E,
 }
 
-impl<Q, P, E> MysqlShim<net::TcpStream> for TestingShim<Q, P, E>
+#[async_trait]
+impl<Q, P, E> AsyncMysqlShim<Cursor<Vec<u8>>> for TestingShim<Q, P, E>
 where
-    Q: FnMut(&str, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
-    P: FnMut(&str) -> u32,
-    E: FnMut(u32, Vec<msql_srv::ParamValue>, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
+    Q: 'static + Send + Sync + FnMut(&str, QueryResultWriter<Cursor<Vec<u8>>>) -> io::Result<()>,
+    P: 'static + Send + Sync + FnMut(&str) -> u32,
+    E: 'static
+        + Send
+        + Sync
+        + FnMut(u32, Vec<msql_srv::ParamValue>, QueryResultWriter<Cursor<Vec<u8>>>) -> io::Result<()>,
 {
     type Error = io::Error;
 
-    fn on_prepare(
-        &mut self,
-        query: &str,
-        info: StatementMetaWriter<net::TcpStream>,
-    ) -> io::Result<()> {
+    async fn on_prepare<'a>(
+        &'a mut self,
+        query: &'a str,
+        info: StatementMetaWriter<'a, Cursor<Vec<u8>>>,
+    ) -> Result<(), Self::Error> {
         let id = (self.on_p)(query);
         info.reply(id, &self.params, &self.columns)
     }
 
-    fn on_execute(
-        &mut self,
+    async fn on_execute<'a>(
+        &'a mut self,
         id: u32,
-        params: ParamParser,
-        results: QueryResultWriter<net::TcpStream>,
-    ) -> io::Result<()> {
+        params: ParamParser<'a>,
+        results: QueryResultWriter<'a, Cursor<Vec<u8>>>,
+    ) -> Result<(), Self::Error> {
         (self.on_e)(id, params.into_iter().collect(), results)
     }
 
-    fn on_close(&mut self, _: u32) {}
+    async fn on_close<'a>(&'a mut self, _stmt: u32) {}
 
-    fn on_query(
-        &mut self,
-        query: &str,
-        results: QueryResultWriter<net::TcpStream>,
-    ) -> io::Result<()> {
-        (self.on_q)(query, results)
+    async fn on_query<'a>(
+        &'a mut self,
+        query: &'a str,
+        results: QueryResultWriter<'a, Cursor<Vec<u8>>>,
+    ) -> Result<(), Self::Error> {
+        if query.eq_ignore_ascii_case("SELECT @@socket")
+            || query.eq_ignore_ascii_case("SELECT @@wait_timeout")
+        {
+            results.completed(OkResponse::default())
+        } else {
+            (self.on_q)(query, results)
+        }
     }
 }
 
 impl<Q, P, E> TestingShim<Q, P, E>
 where
-    Q: 'static + Send + FnMut(&str, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
-    P: 'static + Send + FnMut(&str) -> u32,
+    Q: 'static + Send + Sync + FnMut(&str, QueryResultWriter<Cursor<Vec<u8>>>) -> io::Result<()>,
+    P: 'static + Send + Sync + FnMut(&str) -> u32,
     E: 'static
         + Send
-        + FnMut(u32, Vec<msql_srv::ParamValue>, QueryResultWriter<net::TcpStream>) -> io::Result<()>,
+        + Sync
+        + FnMut(u32, Vec<msql_srv::ParamValue>, QueryResultWriter<Cursor<Vec<u8>>>) -> io::Result<()>,
 {
     fn new(on_q: Q, on_p: P, on_e: E) -> Self {
         TestingShim {
@@ -84,72 +96,75 @@ where
         self
     }
 
-    fn test<C, F>(self, c: C)
+    async fn test<C, F>(self, c: C)
     where
-        F: Future<Output = Result<(), Box<dyn Error>>> + 'static,
-        C: Fn(mysql_async::Conn) -> F,
+        F: IntoFuture<Item = (), Error = mysql_async::error::Error>,
+        C: FnOnce(mysql_async::Conn) -> F + Send + Sync + 'static,
     {
-        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let jh = thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
-            MysqlIntermediary::run_on_tcp(self, s)
+
+        let listen = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+
+            AsyncMysqlIntermediary::run_on(self, socket).await.unwrap();
         });
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let conn = mysql_async::Conn::new(
-                Opts::from_url(&format!("mysql://127.0.0.1:{}", port)).unwrap(),
-            )
-            .await
-            .unwrap();
-            c(conn).await
-        })
-        .unwrap();
+        let conn = task::spawn_blocking(move || {
+            mysql_async::Conn::new(format!("mysql://127.0.0.1:{}", port))
+                .and_then(|conn| c(conn))
+                .wait()
+        });
 
-        jh.join().unwrap().unwrap();
+        let (r1, r2) = tokio::join!(listen, conn);
+
+        r1.unwrap();
+        r2.unwrap().unwrap();
     }
 }
 
-#[test]
-fn it_connects() {
+#[tokio::test]
+async fn it_connects() {
     TestingShim::new(
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|_| async { Ok(()) })
+    .test(|_| Ok(()))
+    .await;
 }
 
-#[test]
-fn it_pings() {
+#[tokio::test]
+async fn it_pings() {
     TestingShim::new(
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        db.ping().await.map(|_| ())?;
-        Ok(())
-    })
+    .test(|db| db.ping().map(|_| ()))
+    .await;
 }
 
-#[test]
-fn empty_response() {
+#[tokio::test]
+async fn empty_response() {
     TestingShim::new(
         |_, w| w.completed(OkResponse::default()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn no_rows() {
+#[tokio::test]
+async fn no_rows() {
     let cols = [Column {
         table: String::new(),
         column: "a".to_owned(),
@@ -161,43 +176,55 @@ fn no_rows() {
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn no_columns() {
+#[tokio::test]
+async fn no_columns() {
     TestingShim::new(
         move |_, w| w.start(&[])?.finish(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn no_columns_but_rows() {
+#[tokio::test]
+async fn no_columns_but_rows() {
     TestingShim::new(
         move |_, w| w.start(&[])?.write_col(42).map(|_| ()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn really_long_query() {
+#[tokio::test]
+async fn really_long_query() {
     let long = "CREATE TABLE `stories` (`id` int unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, `always_null` int, `created_at` datetime, `user_id` int unsigned, `url` varchar(250) DEFAULT '', `title` varchar(150) DEFAULT '' NOT NULL, `description` mediumtext, `short_id` varchar(6) DEFAULT '' NOT NULL, `is_expired` tinyint(1) DEFAULT 0 NOT NULL, `is_moderated` tinyint(1) DEFAULT 0 NOT NULL, `markeddown_description` mediumtext, `story_cache` mediumtext, `merged_story_id` int, `unavailable_at` datetime, `twitter_id` varchar(20), `user_is_author` tinyint(1) DEFAULT 0,  INDEX `index_stories_on_created_at`  (`created_at`), fulltext INDEX `index_stories_on_description`  (`description`),   INDEX `is_idxes`  (`is_expired`, `is_moderated`),  INDEX `index_stories_on_is_expired`  (`is_expired`),  INDEX `index_stories_on_is_moderated`  (`is_moderated`),  INDEX `index_stories_on_merged_story_id`  (`merged_story_id`), UNIQUE INDEX `unique_short_id`  (`short_id`), fulltext INDEX `index_stories_on_story_cache`  (`story_cache`), fulltext INDEX `index_stories_on_title`  (`title`),  INDEX `index_stories_on_twitter_id`  (`twitter_id`),  INDEX `url`  (`url`(191)),  INDEX `index_stories_on_user_id`  (`user_id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
     TestingShim::new(
         move |q, w| {
@@ -207,48 +234,48 @@ fn really_long_query() {
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(move |mut db| async move {
-        db.query_drop(long).await?;
-        Ok(())
-    })
+    .test(move |db| db.drop_query(long).map(|_| ()))
+    .await;
 }
 
-#[test]
-fn error_response() {
-    let err = (ErrorKind::ER_NO, "clearly not");
+#[tokio::test]
+async fn error_response() {
+    let err = (ErrorKind::ER_NO, "clearly not".to_string());
+    let err_to_move = err.clone();
     TestingShim::new(
-        move |_, w| w.error(err.0, err.1.as_bytes()),
+        move |_, w| w.error(err_to_move.0, err_to_move.1.as_bytes()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let res: Result<Vec<mysql_async::Row>, _> = db.query("SELECT a, b FROM foo").await;
-
-        match res {
-            Ok(_) => panic!(),
-            Err(mysql_async::Error::Server(mysql_async::ServerError {
-                code,
-                message: ref msg,
-                ref state,
-            })) => {
-                assert_eq!(
-                    state,
-                    &String::from_utf8(err.0.sqlstate().to_vec()).unwrap()
-                );
-                assert_eq!(code, err.0 as u16);
-                assert_eq!(msg, &err.1);
+    .test(move |db| {
+        db.query("SELECT a, b FROM foo").then(move |r| {
+            match r {
+                Ok(_) => assert!(false),
+                Err(mysql_async::error::Error::Server(mysql_async::error::ServerError {
+                    code,
+                    message: ref msg,
+                    ref state,
+                })) => {
+                    assert_eq!(
+                        state,
+                        &String::from_utf8(err.0.sqlstate().to_vec()).unwrap()
+                    );
+                    assert_eq!(code, err.0 as u16);
+                    assert_eq!(msg, &err.1);
+                }
+                Err(e) => {
+                    eprintln!("unexpected {:?}", e);
+                    assert!(false);
+                }
             }
-            Err(e) => {
-                eprintln!("unexpected {:?}", e);
-                panic!();
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     })
+    .await;
 }
 
-#[test]
-fn empty_on_drop() {
+#[tokio::test]
+async fn empty_on_drop() {
     let cols = [Column {
         table: String::new(),
         column: "a".to_owned(),
@@ -260,15 +287,19 @@ fn empty_on_drop() {
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn it_queries_nulls() {
+#[tokio::test]
+async fn it_queries_nulls() {
     TestingShim::new(
         |_, w| {
             let cols = &[Column {
@@ -284,17 +315,21 @@ fn it_queries_nulls() {
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].len(), 1);
-        assert_eq!(rs[0][0], mysql_async::Value::NULL);
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 1);
+                assert_eq!(rs[0].len(), 1);
+                assert_eq!(rs[0][0], mysql_async::Value::NULL);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn it_queries() {
+#[tokio::test]
+async fn it_queries() {
     TestingShim::new(
         |_, w| {
             let cols = &[Column {
@@ -310,17 +345,21 @@ fn it_queries() {
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].len(), 1);
-        assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 1);
+                assert_eq!(rs[0].len(), 1);
+                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn it_queries_many_rows() {
+#[tokio::test]
+async fn it_queries_many_rows() {
     TestingShim::new(
         |_, w| {
             let cols = &[
@@ -347,21 +386,25 @@ fn it_queries_many_rows() {
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
-    .test(|mut db| async move {
-        let rs: Vec<mysql_async::Row> = db.query("SELECT a, b FROM foo").await?;
-        assert_eq!(rs.len(), 2);
-        assert_eq!(rs[0].len(), 2);
-        assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-        assert_eq!(rs[0].get::<i16, _>(1), Some(1025));
-        assert_eq!(rs[1].len(), 2);
-        assert_eq!(rs[1].get::<i16, _>(0), Some(1024));
-        assert_eq!(rs[1].get::<i16, _>(1), Some(1025));
-        Ok(())
+    .test(|db| {
+        db.query("SELECT a, b FROM foo")
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 2);
+                assert_eq!(rs[0].len(), 2);
+                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
+                assert_eq!(rs[0].get::<i16, _>(1), Some(1025));
+                assert_eq!(rs[1].len(), 2);
+                assert_eq!(rs[1].get::<i16, _>(0), Some(1024));
+                assert_eq!(rs[1].get::<i16, _>(1), Some(1025));
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn it_prepares() {
+#[tokio::test]
+async fn it_prepares() {
     let cols = vec![Column {
         table: String::new(),
         column: "a".to_owned(),
@@ -399,19 +442,21 @@ fn it_prepares() {
     )
     .with_params(params)
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a FROM b WHERE c = ?").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, (42i16,)).await?;
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].len(), 1);
-        assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a FROM b WHERE c = ?", (42i16,))
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 1);
+                assert_eq!(rs[0].len(), 1);
+                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn insert_exec() {
+#[tokio::test]
+async fn insert_exec() {
     let params = vec![
         Column {
             table: String::new(),
@@ -513,39 +558,33 @@ fn insert_exec() {
         },
     )
     .with_params(params)
-    .test(|mut db| async move {
-        let prep = db
-            .prep(
-                "INSERT INTO `users` \
-        (`username`, `email`, `password_digest`, `created_at`, \
-        `session_token`, `rss_token`, `mailing_list_token`) \
-        VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .await?;
-
-        let _res: Vec<mysql_async::Row> = db
-            .exec(
-                prep,
-                (
-                    "user199",
-                    "user199@example.com",
-                    "$2a$10$Tq3wrGeC0xtgzuxqOlc3v.07VTUvxvwI70kuoVihoO2cE5qj7ooka",
-                    mysql_async::Value::Date(2018, 4, 6, 13, 0, 56, 0),
-                    "token199",
-                    "rsstoken199",
-                    "mtok199",
-                ),
-            )
-            .await?;
-
-        assert_eq!(db.affected_rows(), 42);
-        assert_eq!(db.last_insert_id(), Some(1));
-        Ok(())
+    .test(|db| {
+        db.prep_exec(
+            "INSERT INTO `users` \
+             (`username`, `email`, `password_digest`, `created_at`, \
+             `session_token`, `rss_token`, `mailing_list_token`) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "user199",
+                "user199@example.com",
+                "$2a$10$Tq3wrGeC0xtgzuxqOlc3v.07VTUvxvwI70kuoVihoO2cE5qj7ooka",
+                mysql_async::Value::Date(2018, 4, 6, 13, 0, 56, 0),
+                "token199",
+                "rsstoken199",
+                "mtok199",
+            ),
+        )
+        .and_then(|res| {
+            assert_eq!(res.affected_rows(), 42);
+            assert_eq!(res.last_insert_id(), Some(1));
+            Ok(())
+        })
     })
+    .await;
 }
 
-#[test]
-fn send_long() {
+#[tokio::test]
+async fn send_long() {
     let cols = vec![Column {
         table: String::new(),
         column: "a".to_owned(),
@@ -583,19 +622,21 @@ fn send_long() {
     )
     .with_params(params)
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a FROM b WHERE c = ?").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, (b"Hello world",)).await?;
-
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].len(), 1);
-        assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a FROM b WHERE c = ?", (b"Hello world",))
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 1);
+                assert_eq!(rs[0].len(), 1);
+                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn it_prepares_many() {
+#[tokio::test]
+async fn it_prepares_many() {
     let cols = vec![
         Column {
             table: String::new(),
@@ -632,29 +673,32 @@ fn it_prepares_many() {
     )
     .with_params(Vec::new())
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a, b FROM x").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, ()).await?;
-        assert_eq!(rs.len(), 2);
-        assert_eq!(rs[0].len(), 2);
-        assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-        assert_eq!(rs[0].get::<i16, _>(1), Some(1025));
-        assert_eq!(rs[1].len(), 2);
-        assert_eq!(rs[1].get::<i16, _>(0), Some(1024));
-        assert_eq!(rs[1].get::<i16, _>(1), Some(1025));
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a, b FROM x", ())
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 2);
+                assert_eq!(rs[0].len(), 2);
+                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
+                assert_eq!(rs[0].get::<i16, _>(1), Some(1025));
+                assert_eq!(rs[1].len(), 2);
+                assert_eq!(rs[1].get::<i16, _>(0), Some(1024));
+                assert_eq!(rs[1].get::<i16, _>(1), Some(1025));
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn prepared_empty() {
+#[tokio::test]
+async fn prepared_empty() {
     let cols = vec![Column {
         table: String::new(),
         column: "a".to_owned(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         colflags: myc::constants::ColumnFlags::empty(),
     }];
-    let cols2 = cols;
+    let cols2 = cols.clone();
     let params = vec![Column {
         table: String::new(),
         column: "c".to_owned(),
@@ -672,16 +716,19 @@ fn prepared_empty() {
     )
     .with_params(params)
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a FROM b WHERE c = ?").await.unwrap();
-        let rs: Vec<mysql_async::Row> = db.exec(prep, (42i16,)).await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a FROM b WHERE c = ?", (42i16,))
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn prepared_no_params() {
+#[tokio::test]
+async fn prepared_no_params() {
     let cols = vec![Column {
         table: String::new(),
         column: "a".to_owned(),
@@ -703,18 +750,21 @@ fn prepared_no_params() {
     )
     .with_params(params)
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("foo").await.unwrap();
-        let rs: Vec<mysql_async::Row> = db.exec(prep, ()).await?;
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].len(), 1);
-        assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
-        Ok(())
+    .test(|db| {
+        db.prep_exec("foo", ())
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 1);
+                assert_eq!(rs[0].len(), 1);
+                assert_eq!(rs[0].get::<i16, _>(0), Some(1024));
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn prepared_nulls() {
+#[tokio::test]
+async fn prepared_nulls() {
     let cols = vec![
         Column {
             table: String::new(),
@@ -754,7 +804,7 @@ fn prepared_nulls() {
             assert!(!params[1].value.is_null());
             assert_eq!(
                 params[0].coltype,
-                myc::constants::ColumnType::MYSQL_TYPE_NULL
+                myc::constants::ColumnType::MYSQL_TYPE_SHORT
             );
             // rust-mysql sends all numbers as LONGLONG :'(
             assert_eq!(
@@ -770,19 +820,25 @@ fn prepared_nulls() {
     )
     .with_params(params)
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a, b FROM x WHERE c = ? AND d = ?").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, (mysql_async::Value::NULL, 42)).await?;
-        assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].len(), 2);
-        assert_eq!(rs[0].get::<Option<i16>, _>(0), Some(None));
-        assert_eq!(rs[0].get::<i16, _>(1), Some(42));
-        Ok(())
+    .test(|db| {
+        db.prep_exec(
+            "SELECT a, b FROM x WHERE c = ? AND d = ?",
+            (mysql_async::Value::NULL, 42),
+        )
+        .and_then(|r| r.collect::<mysql_async::Row>())
+        .and_then(|(_, rs)| {
+            assert_eq!(rs.len(), 1);
+            assert_eq!(rs[0].len(), 2);
+            assert_eq!(rs[0].get::<Option<i16>, _>(0), Some(None));
+            assert_eq!(rs[0].get::<i16, _>(1), Some(42));
+            Ok(())
+        })
     })
+    .await;
 }
 
-#[test]
-fn prepared_no_rows() {
+#[tokio::test]
+async fn prepared_no_rows() {
     let cols = vec![Column {
         table: String::new(),
         column: "a".to_owned(),
@@ -796,40 +852,49 @@ fn prepared_no_rows() {
         move |_, _, w| w.start(&cols[..])?.finish(),
     )
     .with_columns(cols2)
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a, b FROM foo").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, ()).await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a, b FROM foo", ())
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn prepared_no_cols_but_rows() {
+#[tokio::test]
+async fn prepared_no_cols_but_rows() {
     TestingShim::new(
         |_, _| unreachable!(),
         |_| 0,
         move |_, _, w| w.start(&[])?.write_col(42).map(|_| ()),
     )
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a, b FROM foo").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, ()).await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a, b FROM foo", ())
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
 
-#[test]
-fn prepared_no_cols() {
+#[tokio::test]
+async fn prepared_no_cols() {
     TestingShim::new(
         |_, _| unreachable!(),
         |_| 0,
         move |_, _, w| w.start(&[])?.finish(),
     )
-    .test(|mut db| async move {
-        let prep = db.prep("SELECT a, b FROM foo").await?;
-        let rs: Vec<mysql_async::Row> = db.exec(prep, ()).await?;
-        assert_eq!(rs.len(), 0);
-        Ok(())
+    .test(|db| {
+        db.prep_exec("SELECT a, b FROM foo", ())
+            .and_then(|r| r.collect::<mysql_async::Row>())
+            .and_then(|(_, rs)| {
+                assert_eq!(rs.len(), 0);
+                Ok(())
+            })
     })
+    .await;
 }
