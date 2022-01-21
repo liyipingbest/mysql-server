@@ -945,7 +945,7 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, S: AsyncRead + AsyncWrite + Unpi
                 self.reader.r.flush().await?;
                 buf.truncate(0);
                 self.writer.w.set_position(0);
-                
+
                 {
                     let (rseq, auth_response_data) =
                         self.reader.next_async().await?.ok_or_else(|| {
