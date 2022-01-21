@@ -112,7 +112,7 @@ where
 
         let conn = task::spawn_blocking(move || {
             mysql_async::Conn::new(format!("mysql://127.0.0.1:{}", port))
-                .and_then(|conn| c(conn))
+                .and_then(c)
                 .wait()
         });
 
@@ -250,7 +250,7 @@ async fn error_response() {
     .test(move |db| {
         db.query("SELECT a, b FROM foo").then(move |r| {
             match r {
-                Ok(_) => assert!(false),
+                Ok(_) => panic!(),
                 Err(mysql_async::error::Error::Server(mysql_async::error::ServerError {
                     code,
                     message: ref msg,
@@ -265,7 +265,7 @@ async fn error_response() {
                 }
                 Err(e) => {
                     eprintln!("unexpected {:?}", e);
-                    assert!(false);
+                    panic!();
                 }
             }
             Ok(())
