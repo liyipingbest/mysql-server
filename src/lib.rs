@@ -1035,14 +1035,9 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, S: AsyncRead + AsyncWrite + Unpi
                                 w.finish()?;
                             }
                             _ => {
-                                self.shim
-                                    .on_query(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                let mut w = w.start(cols)?;
+                                w.write_row(iter::once(0))?;
+                                w.finish()?;
                             }
                         }
                     } else if !self.process_use_statement_on_query
