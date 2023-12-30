@@ -1,4 +1,4 @@
-# msql-srv-rs
+# mysql-server
 
 [![Crates.io](https://img.shields.io/crates/v/msql_srv.svg)](https://crates.io/crates/msql_srv)
 [![Documentation](https://docs.rs/msql-srv/badge.svg)](https://docs.rs/msql-srv/)
