@@ -86,6 +86,8 @@ enum Finalizer {
     Eof,
 }
 
+
+
 /// Convenience type for providing query results to clients.
 ///
 /// This type should not be dropped without calling
@@ -164,6 +166,17 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
     /// recent insertion.
     pub fn completed(self, ok_packet: OkResponse) -> io::Result<()> {
         self.complete_one(ok_packet)?.no_more_results()
+    }
+
+
+    /// Send an empty resultset response to the client indicating that `rows` rows were affected by
+    /// the query. `last_insert_id` may be given to communiate an identifier for a client's most
+    /// recent insertion.
+    pub fn completed_rows(self, rows: u64, last_insert_id: u64) -> io::Result<()> {
+        let mut res = OkResponse::default();
+        res.affected_rows = rows;
+        res.last_insert_id = last_insert_id;
+        self.complete_one(res)?.no_more_results()
     }
 
     /// Reply to the client's query with an error.

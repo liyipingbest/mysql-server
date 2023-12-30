@@ -138,6 +138,22 @@ pub struct Column {
     pub colflags: ColumnFlags,
 }
 
+
+/// Information about an authenticated user
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct AuthenticationContext<'a> {
+    /// The username exactly as passed by the client,
+    pub username: Option<Vec<u8>>,
+    /// database when log in.
+    pub database: Option<Vec<u8>>,
+    #[cfg(feature = "tls")]
+    /// The TLS certificate chain presented by the client.
+    pub tls_client_certs: Option<&'a [rustls::pki_types::CertificateDer<'a>]>,
+    #[cfg(not(feature = "tls"))]
+    _pd: Option<&'a std::marker::PhantomData<()>>,
+}
+
 /// QueryStatusInfo represents the status of a query.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OkResponse {
@@ -172,14 +188,15 @@ pub trait MysqlShim<W: Write> {
     type Error: From<io::Error>;
 
     /// Server version
-    fn version(&self) -> &str {
+    fn version(&self) -> &[u8] {
         // 5.1.10 because that's what Ruby's ActiveRecord requires
-        "5.1.10-alpha-msql-proxy"
+        //"5.1.10-alpha-msql-proxy"
+        b"      WaveletDB \n    PoweredBy LYP.\n\n\0"
     }
 
     /// Connection id
     fn connect_id(&self) -> u32 {
-        u32::from_le_bytes([0x08, 0x00, 0x00, 0x00])
+        u32::from_le_bytes([0x08, 0x00, 0x00, 0x10])
     }
 
     /// get auth plugin
@@ -255,6 +272,15 @@ pub trait MysqlShim<W: Write> {
 
     /// Called when client switches database.
     fn on_init(&mut self, _: &str, _: InitWriter<'_, W>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Called after successful authentication (including TLS if applicable) passing relevant
+    /// information to allow additional logic in the MySqlShim implementation.
+    fn after_authentication(
+        &mut self,
+        _context: &AuthenticationContext<'_>,
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -459,8 +485,8 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
         self.writer.write_all(&[10])?; // protocol 10
 
-        self.writer.write_all(self.shim.version().as_bytes())?;
-        self.writer.write_all(&[0x00])?;
+        self.writer.write_all(self.shim.version())?;
+        //self.writer.write_all(&[0x00])?;
 
         // connection_id (4 bytes)
         self.writer
@@ -510,6 +536,8 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         self.writer.write_all(default_auth_plugin.as_bytes())?;
         self.writer.write_all(&[0x00])?;
         self.writer.flush()?;
+
+        let mut auth_context = AuthenticationContext::default();
 
         {
             let (mut seq, handshake) = self.reader.next()?.ok_or_else(|| {
@@ -608,6 +636,10 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 self.writer.flush()?;
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
             }
+
+            auth_context.username = Some(handshake.username);
+            auth_context.database = handshake.db;
+            self.shim.after_authentication(&auth_context)?;
         }
 
         writers::write_ok_packet(
