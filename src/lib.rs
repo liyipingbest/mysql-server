@@ -191,7 +191,7 @@ pub trait MysqlShim<W: Write> {
     fn version(&self) -> &[u8] {
         // 5.1.10 because that's what Ruby's ActiveRecord requires
         //"5.1.10-alpha-msql-proxy"
-        b"      WaveletDB \n    PoweredBy LYP.\n\n\0"
+        b"5.1.10-alpha-msql-proxy\0"
     }
 
     /// Connection id
